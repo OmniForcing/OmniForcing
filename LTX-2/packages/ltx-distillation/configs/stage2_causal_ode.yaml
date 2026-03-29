@@ -1,0 +1,96 @@
+# =============================================================================
+# Stage 2: Causal ODE Regression Initialization
+# =============================================================================
+# Converts bidirectional model to causal autoregressive using ODE trajectories.
+# Uses global-visibility learnable sink tokens for audio-video alignment.
+#
+# Prerequisites:
+#   - Stage 1 bidirectional DMD checkpoint
+#   - ODE trajectory LMDB dataset (see data preparation in README)
+
+# =============================================================================
+# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
+# =============================================================================
+checkpoint_path: /path/to/checkpoints/ltx-2-19b-dev.safetensors
+causal_model_checkpoint: null
+# Stage 1 output checkpoint
+bidirectional_model_checkpoint: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
+text_encoder_checkpoint: /path/to/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+
+# =============================================================================
+# Task Configuration
+# =============================================================================
+generator_task: causal_video
+distillation_loss: ode
+disable_causal_mask: false
+
+denoising_step_list: [1000, 757, 522, 0]
+init_mode: "pretrained"
+uniform_timestep: false
+loss_target: "x0"
+
+# =============================================================================
+# Causal Architecture Settings
+# =============================================================================
+num_frame_per_block: 3
+num_audio_sink_tokens: 16
+freeze_audio_sink_tokens: false      # Learnable sink tokens
+sink_visibility: "global"            # Global visibility
+enable_causal_log_rescale: false
+
+video_loss_weight: 1.0
+audio_loss_weight: 0.16
+skip_cross_modal_attention: false
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+lr: 2.0e-05
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+max_grad_norm: 10.0
+gradient_accumulation_steps: 2
+warmup_steps: 100
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+# Path to ODE LMDB dataset (created by create_ode_lmdb.sh)
+data_path: /path/to/data/ode_lmdb
+max_pair: 1000000
+load_audio: true
+num_workers: 8
+
+# =============================================================================
+# FSDP Configuration
+# =============================================================================
+sharding_strategy: hybrid_full
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+min_num_params: 100000000
+
+# =============================================================================
+# Logging and Checkpointing
+# =============================================================================
+output_path: ./outputs/stage2_causal_ode
+log_iters: 100
+benchmark_enabled: true
+benchmark_iters: 100
+benchmark_num_prompts: 16
+benchmark_seed: 12345
+benchmark_video_fps: 24
+benchmark_audio_sample_rate: 24000
+benchmark_num_frame_per_block: 3
+benchmark_clear_cuda_cache_per_round: true
+
+wandb_project: OmniForcing
+wandb_entity: your-wandb-entity
+wandb_name: stage2_causal_ode
+# wandb_api_key: "your-wandb-api-key"
+
+seed: 42
+no_save: false

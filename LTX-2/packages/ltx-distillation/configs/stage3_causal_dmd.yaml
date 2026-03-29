@@ -1,0 +1,171 @@
+# =============================================================================
+# Stage 3: Causal DMD Training
+# =============================================================================
+# Trains the causal autoregressive model with DMD loss.
+# Uses ODE-initialized causal generator + bidirectional teacher/critic.
+#
+# Prerequisites:
+#   - Stage 1 bidirectional DMD checkpoint (teacher and critic)
+#   - Stage 2 ODE-initialized causal checkpoint (generator)
+#   - ODE LMDB dataset
+
+# =============================================================================
+# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
+# =============================================================================
+checkpoint_path: /path/to/checkpoints/ltx-2-19b-dev.safetensors
+gemma_path: /path/to/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
+
+# =============================================================================
+# Checkpoint Loading (Priority: resume_checkpoint > stage1_ckpt_path > generator_ckpt)
+# =============================================================================
+resume_checkpoint: null
+# Stage 2 ODE-initialized causal model
+stage1_ckpt_path: /path/to/outputs/stage2_causal_ode/checkpoint_XXXXX/model.pt
+# Stage 1 bidirectional DMD model (used as generator bootstrap and critic init)
+generator_ckpt: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
+bootstrap_bidirectional_ckpt_path: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
+stage1_ckpt_strict: false
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model_name: ltx2_av
+
+generator_grad:
+  model: true
+real_score_grad:
+  model: false
+fake_score_grad:
+  model: true
+
+# =============================================================================
+# Task Configuration
+# =============================================================================
+generator_task: causal_av
+real_task_type: bidirectional_av
+fake_task_type: bidirectional_av
+training_mode: causal
+use_causal_wrapper: true
+generator_use_causal_wrapper: true
+real_score_use_causal_wrapper: false
+fake_score_use_causal_wrapper: false
+alignment_rounding: round
+
+distillation_loss: dmd
+denoising_loss_type: velocity
+
+# =============================================================================
+# DMD Hyperparameters
+# =============================================================================
+denoising_step_list:
+  - 1000
+  - 757
+  - 522
+  - 0
+
+num_train_timestep: 1000
+real_video_guidance_scale: 5.0
+real_audio_guidance_scale: 9.0
+dmd_latent_mode: direct_noise
+backward_simulation: false
+dfake_gen_update_ratio: 5
+
+# =============================================================================
+# Causal Architecture Settings (preserve from Stage 2)
+# =============================================================================
+num_frame_per_block: 3
+num_audio_sink_tokens: 16
+enable_causal_log_rescale: false
+disable_causal_mask: false
+skip_cross_modal_attention: false
+loss_target: velocity
+
+# =============================================================================
+# Loss Weights and Block-Aware Weighting
+# =============================================================================
+video_loss_weight: 1.0
+audio_loss_weight: 1.0
+audio_start_step: 0
+
+# Block-aware loss weighting for over-exposure suppression.
+# uniform: all blocks equal (default). linear_ramp: ramp from block_weight_min to 1.0.
+block_weight_mode: uniform
+block_weight_min: 0.5
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+
+lr: 2.0e-05
+generator_lr: 2.0e-05
+critic_lr: 2.0e-05
+
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.01
+max_grad_norm: 10.0
+
+scheduler_type: cosine_warmup
+warmup_steps: 1000
+max_steps: 20000
+min_lr: 1.0e-07
+
+gradient_accumulation_steps: 1
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+# Path to ODE LMDB dataset (same as Stage 2)
+data_path: /path/to/data/ode_lmdb
+benchmark_prompt_file: /path/to/data/prompts.txt
+
+negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, excessive noise, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, artifacts around text, inconsistent perspective, cartoonish rendering, uncanny valley effect, mismatched lip sync, silent or muted audio, distorted voice, off-sync audio, repetitive speech, jittery movement, unnatural transitions, flat lighting, stylized filters, or AI artifacts."
+
+# =============================================================================
+# Video/Audio Configuration
+# =============================================================================
+num_frames: 121
+video_height: 512
+video_width: 768
+
+# =============================================================================
+# FSDP Configuration
+# =============================================================================
+sharding_strategy: hybrid_full
+fsdp_backward_prefetch: none
+
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# =============================================================================
+# Logging and Checkpointing
+# =============================================================================
+output_path: ./outputs/stage3_causal_dmd
+log_iters: 200
+
+wandb_project: OmniForcing
+wandb_entity: your-wandb-entity
+wandb_name: stage3_causal_dmd
+# wandb_api_key: "your-wandb-api-key"
+
+seed: 42
+no_save: false
+
+# =============================================================================
+# Benchmark Configuration
+# =============================================================================
+benchmark_enabled: true
+benchmark_iters: 200
+benchmark_num_prompts: 8
+benchmark_seed: 12345
+benchmark_video_fps: 24
+benchmark_audio_sample_rate: 24000
+
+benchmark_mode: causal
+benchmark_num_frame_per_block: 3
+benchmark_clear_cuda_cache_per_round: true
