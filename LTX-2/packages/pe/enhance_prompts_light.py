@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Prompt Enhancement Script for Distillation Dataset
+Prompt Enhancement Script (Light Version) for Distillation Dataset
 
-使用 OpenRouter API 和 Gemini 模型批量扩充 prompts，添加视觉和音频描述。
+Batch-expands short captions into detailed LTX-2 prompts with visual and audio
+descriptions using a local vLLM server with OpenAI-compatible API.
 
-使用方式:
-    python enhance_prompts.py --input prompts.txt --output enhanced_prompts.txt
+Usage:
+    python enhance_prompts_light.py --input captions.txt --output prompts.txt
 
-或者直接修改下方 CONFIG 参数后运行:
-    python enhance_prompts.py
+Or edit the CONFIG dict below and run directly:
+    python enhance_prompts_light.py
 """
 
 import argparse
@@ -23,49 +24,49 @@ import requests
 from tqdm import tqdm
 
 # =============================================================================
-# 配置参数 (可直接在此修改)
+# Configuration (edit directly or override via CLI args)
 # =============================================================================
 
 CONFIG = {
-    # vLLM 本地 API 配置 (OpenAI 兼容格式)
-    "api_key": "EMPTY",                 # 本地 vLLM 不需要 key，填任意值
-    "api_base": "http://localhost:8000/v1/chat/completions",  # vLLM 默认端口
-    "model": "gemma-3-12b",              # vLLM 启动时的 --served-model-name
+    # vLLM local API config (OpenAI-compatible format)
+    "api_key": "EMPTY",                 # Local vLLM needs no key
+    "api_base": "http://localhost:8000/v1/chat/completions",  # vLLM default port
+    "model": "gemma-3-12b",              # --served-model-name when launching vLLM
 
-    # 生成参数
+    # Generation parameters
     "temperature": 0.7,
-    "max_tokens": 4096,                  # Gemma 3 本地推理，适当减小
+    "max_tokens": 4096,
     "top_p": 0.9,
 
-    # 输入输出路径 (命令行参数会覆盖这些)
+    # Input/output paths (CLI args override these)
     "input_file": "./captions.txt",
     "output_file": "./captions_enhanced.txt",
 
-    # System prompt file path (optional, uses built-in prompt if not provided)
-    "system_prompt_file": "",
+    # System prompt file path
+    "system_prompt_file": os.path.join(os.path.dirname(__file__), "light_system_prompt.txt"),
 
-    # 并发和重试配置 (本地 vLLM 可以更激进)
-    "max_workers": 32,          # 并发线程数，根据 GPU 显存调整
-    "retry_times": 3,           # 失败重试次数
-    "retry_delay": 1.0,         # 重试间隔(秒)
-    "request_delay": 0.05,      # 请求间隔(秒)，本地可以很小
+    # Concurrency and retry config
+    "max_workers": 32,          # Concurrent threads, adjust by GPU memory
+    "retry_times": 3,           # Retry count on failure
+    "retry_delay": 1.0,         # Retry interval (seconds)
+    "request_delay": 0.05,      # Inter-request delay (seconds)
 
-    # 断点续传
-    "resume": True,             # 是否启用断点续传
-    "checkpoint_interval": 10,  # 每处理多少条保存一次 checkpoint
+    # Checkpoint resume
+    "resume": True,             # Enable checkpoint resume
+    "checkpoint_interval": 10,  # Save checkpoint every N items
 
-    # 其他
-    "skip_empty_lines": True,   # 跳过空行
-    "verbose": True,            # 显示详细日志
-    "skip_on_error": True,      # 出错时跳过该 prompt（不写入输出）
+    # Misc
+    "skip_empty_lines": True,   # Skip empty lines
+    "verbose": True,            # Show detailed logs
+    "skip_on_error": True,      # Skip failed prompts (don't write to output)
 }
 
 # =============================================================================
-# 核心功能
+# Core functions
 # =============================================================================
 
 def load_system_prompt(filepath: Path) -> str:
-    """加载 system prompt"""
+    """Load system prompt from file."""
     with open(filepath, "r", encoding="utf-8") as f:
         return f.read().strip()
 
@@ -76,10 +77,10 @@ def enhance_single_prompt(
     config: dict,
 ) -> str | None:
     """
-    使用 vLLM 本地 API 增强单个 prompt (OpenAI 兼容格式)
+    Enhance a single prompt using local vLLM API (OpenAI-compatible format).
 
     Returns:
-        增强后的 prompt，失败时返回 None（跳过该 prompt）
+        Enhanced prompt string, or None on failure (prompt will be skipped).
     """
     headers = {
         "Authorization": f"Bearer {config['api_key']}",
@@ -108,14 +109,14 @@ def enhance_single_prompt(
 
             result = response.json()
 
-            # 检查是否有错误信息
+            # Check for API error
             if "error" in result:
                 error_msg = result.get("error", {})
                 if isinstance(error_msg, dict):
                     error_msg = error_msg.get("message", str(error_msg))
                 raise RuntimeError(f"API error: {error_msg}")
 
-            # 检查 rate limit
+            # Check rate limit
             if response.status_code == 429:
                 wait_time = config["retry_delay"] * (attempt + 2)
                 tqdm.write(f"[WARN] Rate limited, waiting {wait_time}s...")
@@ -124,13 +125,13 @@ def enhance_single_prompt(
 
             response.raise_for_status()
 
-            # 解析响应
+            # Parse response
             if "choices" not in result or len(result["choices"]) == 0:
                 raise KeyError(f"No 'choices' in response: {str(result)[:200]}")
 
             enhanced = result["choices"][0]["message"]["content"].strip()
 
-            # 清理可能的格式问题（移除开头的特殊字符）
+            # Clean formatting issues (strip leading/trailing quotes)
             if enhanced.startswith('"') and enhanced.endswith('"'):
                 enhanced = enhanced[1:-1]
 
@@ -144,13 +145,13 @@ def enhance_single_prompt(
                 continue
             else:
                 tqdm.write(f"[ERROR] Failed after {config['retry_times']} attempts: {str(e)[:150]}")
-                return None  # 返回 None，跳过该 prompt
+                return None
 
     return None
 
 
 def load_checkpoint(output_file: Path) -> set[int]:
-    """加载已处理的行号（用于断点续传）"""
+    """Load processed line indices for checkpoint resume."""
     checkpoint_file = output_file.with_suffix(".checkpoint")
     if checkpoint_file.exists():
         with open(checkpoint_file, "r") as f:
@@ -159,7 +160,7 @@ def load_checkpoint(output_file: Path) -> set[int]:
 
 
 def save_checkpoint(output_file: Path, processed_indices: set[int]):
-    """保存 checkpoint"""
+    """Save checkpoint file."""
     checkpoint_file = output_file.with_suffix(".checkpoint")
     with open(checkpoint_file, "w") as f:
         f.write("\n".join(map(str, sorted(processed_indices))))
@@ -170,14 +171,12 @@ def process_prompts(
     output_file: Path,
     config: dict,
 ):
-    """
-    批量处理 prompts
-    """
-    # 加载 system prompt
+    """Batch-process all prompts with concurrent enhancement."""
+    # Load system prompt
     system_prompt = load_system_prompt(config["system_prompt_file"])
     print(f"Loaded system prompt from: {config['system_prompt_file']}")
 
-    # 读取输入文件
+    # Read input file
     with open(input_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
@@ -190,16 +189,14 @@ def process_prompts(
 
     print(f"Loaded {len(prompts)} prompts from: {input_file}")
 
-    # 断点续传：加载已处理的索引
+    # Checkpoint resume: load previously processed indices
     processed_indices = set()
     results = {}
 
     if config["resume"] and output_file.exists():
-        # 读取已有的输出
         with open(output_file, "r", encoding="utf-8") as f:
             existing_lines = f.readlines()
 
-        # 尝试加载 checkpoint
         checkpoint_file = output_file.with_suffix(".checkpoint")
         if checkpoint_file.exists():
             with open(checkpoint_file, "r") as f:
@@ -207,18 +204,17 @@ def process_prompts(
                 if content:
                     processed_indices = set(map(int, content.split("\n")))
 
-        # 如果没有 checkpoint 但有输出文件，假设是按顺序处理的
+        # If no checkpoint but output exists, assume sequential processing
         if not processed_indices and existing_lines:
             processed_indices = set(range(len(existing_lines)))
 
-        # 加载已有结果
         for idx, line in enumerate(existing_lines):
             if idx < len(prompts):
                 results[prompts[idx][0]] = line.strip()
 
         print(f"Resuming: {len(processed_indices)} prompts already processed")
 
-    # 过滤出需要处理的 prompts
+    # Filter remaining prompts
     remaining = [(i, p) for i, p in prompts if i not in processed_indices]
     print(f"Remaining: {len(remaining)} prompts to process")
 
@@ -226,17 +222,16 @@ def process_prompts(
         print("All prompts already processed!")
         return
 
-    # 用于线程安全的写入
     write_lock = Lock()
     progress_bar = tqdm(total=len(remaining), desc="Enhancing prompts")
 
     def process_one(item):
         idx, prompt = item
-        time.sleep(config["request_delay"])  # Rate limiting
+        time.sleep(config["request_delay"])
         enhanced = enhance_single_prompt(prompt, system_prompt, config)
         return idx, enhanced
 
-    # 并发处理
+    # Concurrent processing
     skipped_count = 0
     with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
         futures = {executor.submit(process_one, item): item for item in remaining}
@@ -253,10 +248,9 @@ def process_prompts(
                 processed_indices.add(idx)
                 checkpoint_counter += 1
 
-                # 定期保存 checkpoint
+                # Periodic checkpoint save
                 if checkpoint_counter % config["checkpoint_interval"] == 0:
                     save_checkpoint(output_file, processed_indices)
-                    # 也保存当前结果
                     _save_results(output_file, results, prompts)
 
             progress_bar.update(1)
@@ -266,10 +260,10 @@ def process_prompts(
 
     progress_bar.close()
 
-    # 最终保存
+    # Final save
     _save_results(output_file, results, prompts)
 
-    # 删除 checkpoint 文件
+    # Remove checkpoint file
     checkpoint_file = output_file.with_suffix(".checkpoint")
     if checkpoint_file.exists():
         checkpoint_file.unlink()
@@ -279,11 +273,10 @@ def process_prompts(
 
 
 def _save_results(output_file: Path, results: dict, prompts: list):
-    """按原始顺序保存成功的结果，跳过失败的 prompt"""
+    """Save successful results in original order, skip failed prompts."""
     with open(output_file, "w", encoding="utf-8") as f:
         for original_idx, _ in prompts:
             if original_idx in results and results[original_idx] is not None:
-                # 确保单行输出（移除换行符）
                 line = results[original_idx].replace("\n", " ").replace("\r", " ")
                 f.write(line + "\n")
 
@@ -330,7 +323,7 @@ def main():
 
     args = parser.parse_args()
 
-    # 更新配置
+    # Update config from CLI args
     config = CONFIG.copy()
     config["input_file"] = args.input
     config["output_file"] = args.output
@@ -341,8 +334,6 @@ def main():
     if args.api_key:
         config["api_key"] = args.api_key
 
-    # 本地 vLLM 不需要检查 API key
-
     input_file = Path(args.input)
     output_file = Path(args.output)
 
@@ -351,7 +342,7 @@ def main():
         return
 
     print("=" * 60)
-    print("Prompt Enhancement Script")
+    print("Prompt Enhancement Script (Light)")
     print("=" * 60)
     print(f"Model:   {config['model']}")
     print(f"Input:   {input_file}")

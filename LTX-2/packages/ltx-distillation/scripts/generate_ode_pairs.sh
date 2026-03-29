@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# ODE Pair Generation - 单卡
+# ODE Pair Generation - Single GPU
 # =============================================================================
 # Generates ODE trajectory pairs using the bidirectional teacher model.
 # These pairs are used for causal model initialization (Stage 1).

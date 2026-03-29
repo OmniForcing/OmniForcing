@@ -18,10 +18,8 @@
 
 ## News
 
-- **[2026/03]** Training code and data processing pipeline open-sourced.
+- **[2026/03]** Full training code and data processing pipeline open-sourced.
 - **[2026/03]** Paper released on [arXiv 2603.11647](https://arxiv.org/abs/2603.11647). Project page is live at [OmniForcing.com](https://omniforcing.com).
-
-> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon.
 
 
 ## Method Overview
@@ -98,10 +96,13 @@ At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step 
 ### Installation
 
 ```bash
-git clone https://github.com/YourOrg/OmniForcing.git
+git clone https://github.com/OmniForcing/OmniForcing.git
 cd OmniForcing/LTX-2
 
-# Install packages (editable mode recommended)
+# Install with uv (recommended)
+uv sync
+
+# Or install with pip
 pip install -e packages/ltx-core
 pip install -e packages/ltx-pipelines
 pip install -e packages/ltx-causal
@@ -110,14 +111,14 @@ pip install -e packages/ltx-distillation
 
 ### Download Models
 
-Download the following pretrained models:
+Download the following pretrained models and update the paths in the config files:
 
 | Model | Description |
 |-------|-------------|
-| [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-Video-2) | LTX-2 base model (19B) |
-| [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-12b-it) | Gemma text encoder |
+| `ltx-2-19b-dev.safetensors` | LTX-2 base model (19B), from [Lightricks/LTX-Video-2](https://huggingface.co/Lightricks/LTX-Video-2) |
+| `gemma-3-12b-it-qat-q4_0-unquantized` | Gemma 3 12B text encoder (unquantized QAT variant) |
 
-Update the paths in the config files to point to your downloaded models.
+> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon.
 
 
 ## Training Pipeline
@@ -131,15 +132,15 @@ Distills the LTX-2 teacher model from 1000-step to 4-step inference while preser
 **Data preparation:** Prepare a text prompts file (one prompt per line). You can use our prompt enhancement tools to expand short captions into detailed LTX-2 prompts:
 
 ```bash
-# Option A: Using vLLM + any LLM (recommended)
 cd LTX-2/packages/pe
-# First start a vLLM server with your preferred LLM
-# vllm serve /path/to/your/llm --tensor-parallel-size 8
+
+# Option A: Heavy mode - vLLM + LLM (recommended, higher quality)
+# First start a vLLM server with your preferred LLM:
+#   vllm serve /path/to/your/llm --tensor-parallel-size 8
 python batch_enhance.py captions.txt --duration 5s
 
-# Option B: Using local Gemma model
-cd LTX-2/packages
-python enhance_prompts.py --input captions.txt --output prompts.txt
+# Option B: Light mode - local Gemma via vLLM (simpler, faster)
+python enhance_prompts_light.py --input captions.txt --output prompts.txt
 ```
 
 **Training:**
@@ -256,8 +257,11 @@ OmniForcing/
         │       ├── inference/               # Benchmark pipelines
         │       └── models/                  # Model wrappers
         ├── ltx-pipelines/               # Inference pipeline utilities
-        ├── pe/                          # Prompt enhancement (vLLM-based)
-        └── enhance_prompts.py           # Prompt enhancement (API-based)
+        └── pe/                          # Prompt enhancement tools
+            ├── batch_enhance.py         # Heavy mode (vLLM + LLM, higher quality)
+            ├── prompt_enhancer.py       # Heavy mode core (duration-aware)
+            ├── enhance_prompts_light.py # Light mode (simpler, faster)
+            └── light_system_prompt.txt  # Light mode system prompt
 ```
 
 
