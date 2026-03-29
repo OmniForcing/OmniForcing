@@ -36,9 +36,9 @@ OmniForcing employs a **three-stage distillation pipeline** to progressively tra
 
 - **Stage 2 -- Causal ODE Regression:** The model is equipped with our **Asymmetric Block-Causal Mask** and trained via ODE trajectory regression to adapt to causal attention. An **Audio Sink Token** mechanism with **Identity RoPE** is introduced to resolve the Softmax collapse and gradient explosion caused by extreme audio token sparsity.
 
-- **Stage 3 -- Joint Causal DMD:** The model is trained with DMD loss in causal mode. Two variants are provided:
-  - **Causal DMD** (main branch): Block-wise DMD training with bidirectional teacher/critic.
-  - **Self-Forcing DMD** (`self-forcing` branch): Autoregressive self-forcing rollout that enables the model to dynamically self-correct cumulative cross-modal errors from exposure bias.
+- **Stage 3 -- Joint Self-Forcing DMD:** The model autoregressively unrolls its own generations during training, enabling dynamic self-correction of cumulative cross-modal errors from exposure bias. Two variants are provided:
+  - **Self-Forcing DMD** (`main` branch): Autoregressive self-forcing rollout with DMD loss (recommended).
+  - **Causal DMD** (`causal-dmd` branch): Block-wise DMD training without self-forcing rollout.
 
 At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step context complexity to O(L) and enables concurrent execution of the video and audio streams, achieving real-time synchronized generation.
 
@@ -197,20 +197,20 @@ Two variants are available:
 
 | Variant | Branch | Description |
 |---------|--------|-------------|
-| **Causal DMD** | `main` | Block-wise DMD training with bidirectional teacher/critic |
-| **Self-Forcing DMD** | `self-forcing` | Autoregressive rollout for exposure bias correction |
+| **Self-Forcing DMD** | `main` | Autoregressive self-forcing rollout with DMD loss (recommended) |
+| **Causal DMD** | `causal-dmd` | Block-wise DMD training without self-forcing rollout |
 
-**Training (Causal DMD):**
+**Training (Self-Forcing DMD, default):**
 
 ```bash
 # Edit configs/stage3_causal_dmd.yaml with your paths, then:
 ./scripts/train_stage3_causal_dmd.sh
 ```
 
-**Training (Self-Forcing DMD):**
+**Training (Causal DMD, alternative):**
 
 ```bash
-git checkout self-forcing
+git checkout causal-dmd
 ./scripts/train_stage3_causal_dmd.sh
 ```
 

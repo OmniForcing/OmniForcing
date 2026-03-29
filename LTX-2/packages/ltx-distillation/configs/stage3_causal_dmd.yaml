@@ -1,8 +1,9 @@
 # =============================================================================
-# Stage 3: Causal DMD Training
+# Stage 3: Self-Forcing Causal DMD Training
 # =============================================================================
-# Trains the causal autoregressive model with DMD loss.
-# Uses ODE-initialized causal generator + bidirectional teacher/critic.
+# Trains the causal autoregressive model with self-forcing DMD loss.
+# The generator autoregressively unrolls its own generations during training,
+# enabling dynamic self-correction of cumulative cross-modal errors.
 #
 # Prerequisites:
 #   - Stage 1 bidirectional DMD checkpoint (teacher and critic)
@@ -44,7 +45,7 @@ fake_score_grad:
 generator_task: causal_av
 real_task_type: bidirectional_av
 fake_task_type: bidirectional_av
-training_mode: causal
+training_mode: causal_self_forcing
 use_causal_wrapper: true
 generator_use_causal_wrapper: true
 real_score_use_causal_wrapper: false
@@ -79,6 +80,14 @@ enable_causal_log_rescale: false
 disable_causal_mask: false
 skip_cross_modal_attention: false
 loss_target: velocity
+
+# =============================================================================
+# Self-Forcing Configuration
+# =============================================================================
+self_forcing_runtime: prefix_rerun       # prefix_rerun or kv_cache
+self_forcing_min_generated_blocks: 5
+self_forcing_max_generated_blocks: 5
+self_forcing_loss_scope: last_block      # Loss computed on last generated block
 
 # =============================================================================
 # Loss Weights and Block-Aware Weighting
@@ -145,12 +154,12 @@ text_encoder_fsdp_wrap_strategy: size
 # =============================================================================
 # Logging and Checkpointing
 # =============================================================================
-output_path: ./outputs/stage3_causal_dmd
+output_path: ./outputs/stage3_self_forcing_dmd
 log_iters: 200
 
 wandb_project: OmniForcing
 wandb_entity: your-wandb-entity
-wandb_name: stage3_causal_dmd
+wandb_name: stage3_self_forcing_dmd
 # wandb_api_key: "your-wandb-api-key"
 
 seed: 42

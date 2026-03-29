@@ -206,6 +206,7 @@ class Trainer:
 
         self.step = 0
         self.max_grad_norm = getattr(config, "max_grad_norm", 10.0)
+        self.log_iters = int(getattr(config, "log_iters", 0))
         self.layerwise_grad_log_interval = max(
             1, int(getattr(config, "layerwise_grad_log_interval", config.log_iters))
         )
@@ -359,7 +360,7 @@ class Trainer:
         """
         config = self.config
         self.benchmark_enabled = getattr(config, "benchmark_enabled", True)
-        self.benchmark_iters = getattr(config, "benchmark_iters", config.log_iters)
+        self.benchmark_iters = int(getattr(config, "benchmark_iters", config.log_iters))
         self.benchmark_seed = getattr(config, "benchmark_seed", 12345)
         self.benchmark_num_prompts = getattr(config, "benchmark_num_prompts", 2)
         self.benchmark_video_fps = getattr(config, "benchmark_video_fps", 24)
@@ -373,6 +374,11 @@ class Trainer:
         self.benchmark_use_kv_cache = bool(getattr(config, "benchmark_use_kv_cache", False))
         self.benchmark_clear_cuda_cache_per_round = bool(getattr(config, "benchmark_clear_cuda_cache_per_round", True))
         self.benchmark_prompts = []
+
+        if self.benchmark_iters <= 0:
+            self.benchmark_enabled = False
+            if self.is_main_process:
+                print("[Benchmark] Disabled because benchmark_iters <= 0.")
 
         if self.benchmark_mode == "causal" and self.benchmark_use_kv_cache:
             if self.is_main_process:
@@ -947,7 +953,8 @@ class Trainer:
             # Save checkpoint
             if (
                 not getattr(self.config, "no_save", False)
-                and self.step % self.config.log_iters == 0
+                and self.log_iters > 0
+                and self.step % self.log_iters == 0
             ):
                 self.save()
                 torch.cuda.empty_cache()

@@ -10,6 +10,7 @@ Key differences from CausVid:
 - Supports audio-video time alignment
 """
 
+from contextlib import nullcontext
 from typing import Tuple, Dict, Any, Optional, List
 import math
 import torch
@@ -86,6 +87,7 @@ class LTX2DMD(nn.Module):
         self.real_task_type = getattr(args, "real_task_type", args.generator_task)
         self.fake_task_type = getattr(args, "fake_task_type", args.generator_task)
         self.training_mode = getattr(args, "training_mode", "bidirectional")
+        self.enable_self_forcing = "self_forcing" in str(self.training_mode).lower()
         inferred_causal = (
             "causal" in str(self.training_mode).lower()
             or "causal" in str(self.generator_task_type).lower()
@@ -119,6 +121,30 @@ class LTX2DMD(nn.Module):
             raise ImportError(
                 "Causal wrapper requires ltx-causal package. "
                 "Install with: pip install -e packages/ltx-causal"
+            )
+        if self.enable_self_forcing and not self.generator_use_causal_wrapper:
+            raise ValueError("Stage3 Self-Forcing requires generator_use_causal_wrapper=true")
+        self.self_forcing_runtime = str(
+            getattr(args, "self_forcing_runtime", "prefix_rerun")
+        ).lower()
+        if self.self_forcing_runtime not in {"prefix_rerun", "kv_cache"}:
+            raise ValueError(
+                f"Invalid self_forcing_runtime={self.self_forcing_runtime}, "
+                "expected prefix_rerun|kv_cache"
+            )
+        self.self_forcing_min_generated_blocks = getattr(
+            args, "self_forcing_min_generated_blocks", None
+        )
+        self.self_forcing_max_generated_blocks = getattr(
+            args, "self_forcing_max_generated_blocks", None
+        )
+        self.self_forcing_loss_scope = str(
+            getattr(args, "self_forcing_loss_scope", "last_block")
+        ).lower()
+        if self.self_forcing_loss_scope != "last_block":
+            raise ValueError(
+                f"Invalid self_forcing_loss_scope={self.self_forcing_loss_scope}, "
+                "only last_block is currently supported"
             )
 
         # Initialize models (will be populated by _init_models or external loading)
@@ -493,15 +519,51 @@ class LTX2DMD(nn.Module):
             self.fake_score.enable_gradient_checkpointing()
 
         # Checkpoint loading with priority:
-        #   resume_checkpoint > stage1_ckpt_path > generator_ckpt
+        #   resume_checkpoint > generator_ckpt > stage1_ckpt_path
         stage1_ckpt = getattr(args, "stage1_ckpt_path", None)
         stage1_strict = getattr(args, "stage1_ckpt_strict", False)
+        generator_ckpt = getattr(args, "generator_ckpt", None)
+        generator_ckpt_strict = getattr(args, "generator_ckpt_strict", False)
 
-        if stage1_ckpt:
+        if generator_ckpt:
+            print(f"Loading pretrained generator from {generator_ckpt}")
+            ckpt = torch.load(generator_ckpt, map_location="cpu")
+            gen_sd = ckpt.get("generator", ckpt)
+            if self.generator_use_causal_wrapper:
+                gen_sd = _remap_state_dict_keys(gen_sd)
+            missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=generator_ckpt_strict)
+            real_missing_g = [k for k in missing_g if "mask_builder" not in k]
+            if real_missing_g:
+                print(f"  [generator] missing keys ({len(real_missing_g)}): {real_missing_g[:10]}...")
+            if unexpected_g:
+                print(f"  [generator] unexpected keys ({len(unexpected_g)}): {unexpected_g[:10]}...")
+
+            sink_key = None
+            for k in gen_sd:
+                if "audio_sink_tokens" in k:
+                    sink_key = k
+                    break
+            if sink_key is not None:
+                for pname, param in self.generator.named_parameters():
+                    if "audio_sink_tokens" in pname:
+                        assert param.shape == gen_sd[sink_key].shape, (
+                            f"[Stage3] Sink token shape mismatch in generator: "
+                            f"model={param.shape} vs ckpt={gen_sd[sink_key].shape}"
+                        )
+                        break
+            print("[Stage3] Generator checkpoint load complete")
+
+        elif stage1_ckpt:
             print(f"[Stage2] Loading Stage 1 checkpoint from {stage1_ckpt}")
             ckpt = torch.load(stage1_ckpt, map_location="cpu")
 
             gen_sd = ckpt.get("generator", ckpt)
+            # Stage 3 configs may point stage1_ckpt_path at either:
+            # 1. a causal/ODE checkpoint already keyed as model.*
+            # 2. a bidirectional DMD checkpoint keyed as model.velocity_model.*
+            # The causal generator expects model.* keys, so remap before load.
+            if self.generator_use_causal_wrapper:
+                gen_sd = _remap_state_dict_keys(gen_sd)
             missing_g, unexpected_g = self.generator.load_state_dict(gen_sd, strict=stage1_strict)
             real_missing_g = [k for k in missing_g if "mask_builder" not in k]
             if real_missing_g:
@@ -540,11 +602,6 @@ class LTX2DMD(nn.Module):
                             )
                             break
             print("[Stage2] Stage1 checkpoint load complete")
-
-        elif getattr(args, "generator_ckpt", None):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")["generator"]
-            self.generator.load_state_dict(state_dict, strict=True)
 
     def _round_align(self, value: float) -> int:
         if self.alignment_rounding == "floor":
@@ -696,6 +753,400 @@ class LTX2DMD(nn.Module):
         noisy_audio = self.add_noise(clean_audio, noise_audio, audio_sigma)
 
         return noisy_video, noisy_audio, video_sigma, audio_sigma, video_mask, audio_mask
+
+    def _sample_synced_int(self, min_value: int, max_value: int) -> int:
+        if min_value > max_value:
+            raise ValueError(f"Invalid synced sampling range [{min_value}, {max_value}]")
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                sampled = torch.randint(
+                    min_value,
+                    max_value + 1,
+                    (1,),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                sampled = torch.empty((1,), device=self.device, dtype=torch.long)
+            dist.broadcast(sampled, src=0)
+            return int(sampled.item())
+        return int(
+            torch.randint(
+                min_value,
+                max_value + 1,
+                (1,),
+                device=self.device,
+                dtype=torch.long,
+            ).item()
+        )
+
+    def _get_self_forcing_rollout_blocks(self, num_video_frames: int):
+        blocks = self._get_causal_blocks(num_video_frames)
+        standard_blocks = blocks[1:]
+        if not standard_blocks:
+            raise ValueError(
+                f"Self-forcing requires at least one standard causal block, got {num_video_frames} video frames"
+            )
+
+        total_blocks = len(standard_blocks)
+        max_cfg = self.self_forcing_max_generated_blocks
+        if max_cfg is None:
+            max_blocks = total_blocks
+        else:
+            max_blocks = min(total_blocks, max(1, int(max_cfg)))
+
+        min_cfg = self.self_forcing_min_generated_blocks
+        if min_cfg is None:
+            min_blocks = max_blocks
+        else:
+            min_blocks = min(max_blocks, max(1, int(min_cfg)))
+
+        rollout_blocks = self._sample_synced_int(min_blocks, max_blocks)
+        return blocks[0], standard_blocks[:rollout_blocks]
+
+    def _build_masks_for_blocks(
+        self,
+        batch_size: int,
+        num_video_frames: int,
+        num_audio_frames: int,
+        blocks,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        video_mask = torch.zeros(
+            batch_size, num_video_frames, device=self.device, dtype=torch.bool
+        )
+        audio_mask = None
+        if num_audio_frames > 0:
+            audio_mask = torch.zeros(
+                batch_size, num_audio_frames, device=self.device, dtype=torch.bool
+            )
+
+        for block in blocks:
+            video_mask[:, block.video_start:block.video_end] = True
+            if audio_mask is not None:
+                audio_end = min(block.audio_end, num_audio_frames)
+                if audio_end > block.audio_start:
+                    audio_mask[:, block.audio_start:audio_end] = True
+
+        return video_mask, audio_mask
+
+    @staticmethod
+    def _unwrap_module(module: nn.Module) -> nn.Module:
+        current = module
+        while hasattr(current, "module"):
+            current = current.module
+        return current
+
+    def _summon_generator_full_params(self):
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        except ImportError:
+            return nullcontext()
+
+        if isinstance(self.generator, FSDP):
+            return FSDP.summon_full_params(self.generator, recurse=True, writeback=False)
+        return nullcontext()
+
+    @staticmethod
+    def _reshape_sigma_for_block(
+        sigma: torch.Tensor,
+        target: torch.Tensor,
+        wrapper: nn.Module,
+    ) -> torch.Tensor:
+        reshape_sigma = getattr(wrapper, "_reshape_sigma_for_broadcast", None)
+        if callable(reshape_sigma):
+            return reshape_sigma(sigma, target)
+        if sigma.dim() == 1:
+            return sigma.reshape(-1, *[1] * (target.dim() - 1))
+        if sigma.dim() == 2:
+            return sigma.reshape(*sigma.shape, *[1] * (target.dim() - 2))
+        return sigma
+
+    def _renoise_block(self, clean_block: Optional[torch.Tensor], next_sigma: torch.Tensor) -> Optional[torch.Tensor]:
+        if clean_block is None:
+            return None
+        sigma = next_sigma.to(device=clean_block.device, dtype=clean_block.dtype).expand(
+            clean_block.shape[0], clean_block.shape[1]
+        )
+        return self.add_noise(clean_block, torch.randn_like(clean_block), sigma)
+
+    def _run_prefix_rerun_block(
+        self,
+        *,
+        prev_video: torch.Tensor,
+        prev_audio: Optional[torch.Tensor],
+        block,
+        conditional_dict: Dict[str, Any],
+        requires_grad: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = prev_video.shape[0]
+        video_tail_shape = prev_video.shape[2:]
+        current_video = torch.randn(
+            (batch_size, block.video_frames, *video_tail_shape),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        current_audio = None
+        if prev_audio is not None:
+            current_audio = torch.randn(
+                (batch_size, block.audio_frames, prev_audio.shape[2]),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+        was_training = self.generator.training
+        if not requires_grad:
+            self.generator.eval()
+
+        try:
+            grad_context = nullcontext() if requires_grad else torch.no_grad()
+            with grad_context:
+                for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                    prefix_video = torch.cat([prev_video, current_video], dim=1)
+                    video_sigma = torch.cat(
+                        [
+                            torch.zeros(
+                                (batch_size, prev_video.shape[1]),
+                                device=self.device,
+                                dtype=self.denoising_sigmas.dtype,
+                            ),
+                            sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
+                                batch_size, current_video.shape[1]
+                            ),
+                        ],
+                        dim=1,
+                    )
+
+                    prefix_audio = None
+                    audio_sigma = None
+                    if current_audio is not None and prev_audio is not None:
+                        prefix_audio = torch.cat([prev_audio, current_audio], dim=1)
+                        audio_sigma = torch.cat(
+                            [
+                                torch.zeros(
+                                    (batch_size, prev_audio.shape[1]),
+                                    device=self.device,
+                                    dtype=self.denoising_sigmas.dtype,
+                                ),
+                                sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
+                                    batch_size, current_audio.shape[1]
+                                ),
+                            ],
+                            dim=1,
+                        )
+
+                    pred_video_prefix, pred_audio_prefix = self.generator(
+                        noisy_image_or_video=prefix_video,
+                        conditional_dict=conditional_dict,
+                        timestep=video_sigma,
+                        noisy_audio=prefix_audio,
+                        audio_timestep=audio_sigma,
+                        use_causal_timestep=False,
+                        force_bidirectional=False,
+                    )
+
+                    current_video = pred_video_prefix[:, block.video_start:block.video_end]
+                    if current_audio is not None:
+                        if pred_audio_prefix is None:
+                            raise RuntimeError(
+                                "Generator returned no audio prediction during self-forcing rollout"
+                            )
+                        current_audio = pred_audio_prefix[:, block.audio_start:block.audio_end]
+
+                    next_sigma = self.denoising_sigmas[sigma_idx + 1]
+                    if float(next_sigma.item()) > 0.0:
+                        current_video = self._renoise_block(current_video, next_sigma)
+                        current_audio = self._renoise_block(current_audio, next_sigma)
+        finally:
+            if not requires_grad and was_training:
+                self.generator.train()
+
+        return current_video, current_audio
+
+    def _build_self_forcing_prefix_cache(
+        self,
+        prefix_video: torch.Tensor,
+        prefix_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if prefix_video.shape[1] == 0:
+            return None
+
+        with self._summon_generator_full_params():
+            generator_module = self._unwrap_module(self.generator)
+            kv_cache = None
+            prefix_blocks = self._get_causal_blocks(prefix_video.shape[1])
+
+            for block in prefix_blocks:
+                video_block = prefix_video[:, block.video_start:block.video_end]
+                audio_block = None
+                audio_sigma = None
+                if prefix_audio is not None:
+                    audio_end = min(block.audio_end, prefix_audio.shape[1])
+                    if audio_end > block.audio_start:
+                        audio_block = prefix_audio[:, block.audio_start:audio_end]
+                        audio_sigma = torch.zeros(
+                            (video_block.shape[0], audio_block.shape[1]),
+                            device=audio_block.device,
+                            dtype=self.denoising_sigmas.dtype,
+                        )
+
+                video_sigma = torch.zeros(
+                    (video_block.shape[0], video_block.shape[1]),
+                    device=video_block.device,
+                    dtype=self.denoising_sigmas.dtype,
+                )
+                _, _, kv_cache = generator_module.model.forward_inference(
+                    video_latent=video_block,
+                    audio_latent=audio_block,
+                    timesteps=video_sigma,
+                    audio_timesteps=audio_sigma,
+                    video_context=conditional_dict["video_context"],
+                    audio_context=conditional_dict["audio_context"],
+                    video_context_mask=conditional_dict.get("video_context_mask"),
+                    audio_context_mask=conditional_dict.get("audio_context_mask"),
+                    kv_cache=kv_cache,
+                    video_start_frame=block.video_start,
+                    audio_start_frame=block.audio_start,
+                    include_audio_sinks=(block.block_idx == 0),
+                )
+
+        return kv_cache
+
+    def _run_kv_rollout_block(
+        self,
+        *,
+        prev_video: torch.Tensor,
+        prev_audio: Optional[torch.Tensor],
+        block,
+        conditional_dict: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        kv_cache = self._build_self_forcing_prefix_cache(prev_video, prev_audio, conditional_dict)
+
+        batch_size = prev_video.shape[0]
+        video_tail_shape = prev_video.shape[2:]
+        current_video = torch.randn(
+            (batch_size, block.video_frames, *video_tail_shape),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        current_audio = None
+        if prev_audio is not None:
+            current_audio = torch.randn(
+                (batch_size, block.audio_frames, prev_audio.shape[2]),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+        with self._summon_generator_full_params():
+            generator_module = self._unwrap_module(self.generator)
+            for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                video_sigma = sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
+                    batch_size, current_video.shape[1]
+                )
+                audio_sigma = None
+                if current_audio is not None:
+                    audio_sigma = sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
+                        batch_size, current_audio.shape[1]
+                    )
+
+                pred_video, pred_audio, _ = generator_module.model.forward_inference(
+                    video_latent=current_video,
+                    audio_latent=current_audio,
+                    timesteps=video_sigma,
+                    audio_timesteps=audio_sigma,
+                    video_context=conditional_dict["video_context"],
+                    audio_context=conditional_dict["audio_context"],
+                    video_context_mask=conditional_dict.get("video_context_mask"),
+                    audio_context_mask=conditional_dict.get("audio_context_mask"),
+                    kv_cache=kv_cache,
+                    video_start_frame=block.video_start,
+                    audio_start_frame=block.audio_start,
+                    include_audio_sinks=False,
+                )
+
+                sigma_video_broadcast = self._reshape_sigma_for_block(video_sigma, current_video, generator_module)
+                current_video = (
+                    current_video.to(torch.float32)
+                    - pred_video.to(torch.float32) * sigma_video_broadcast.to(torch.float32)
+                ).to(self.dtype)
+
+                if current_audio is not None:
+                    sigma_audio_broadcast = self._reshape_sigma_for_block(audio_sigma, current_audio, generator_module)
+                    current_audio = (
+                        current_audio.to(torch.float32)
+                        - pred_audio.to(torch.float32) * sigma_audio_broadcast.to(torch.float32)
+                    ).to(self.dtype)
+
+                next_sigma = self.denoising_sigmas[sigma_idx + 1]
+                if float(next_sigma.item()) > 0.0:
+                    current_video = self._renoise_block(current_video, next_sigma)
+                    current_audio = self._renoise_block(current_audio, next_sigma)
+
+        return current_video, current_audio
+
+    def _run_self_forcing_rollout(
+        self,
+        *,
+        clean_video: torch.Tensor,
+        clean_audio: Optional[torch.Tensor],
+        conditional_dict: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        if clean_video is None:
+            raise ValueError("Self-forcing rollout requires clean_video from ODE data")
+        if getattr(self.args, "backward_simulation", True):
+            raise ValueError("Self-forcing rollout requires backward_simulation=false")
+
+        prefix_block, rollout_blocks = self._get_self_forcing_rollout_blocks(clean_video.shape[1])
+        rollout_video = clean_video[:, prefix_block.video_start:prefix_block.video_end].clone()
+        rollout_audio = None
+        if clean_audio is not None:
+            audio_end = min(prefix_block.audio_end, clean_audio.shape[1])
+            rollout_audio = clean_audio[:, prefix_block.audio_start:audio_end].clone()
+
+        for idx, block in enumerate(rollout_blocks):
+            is_last = idx == len(rollout_blocks) - 1
+            if self.self_forcing_runtime == "kv_cache" and not is_last:
+                current_video, current_audio = self._run_kv_rollout_block(
+                    prev_video=rollout_video,
+                    prev_audio=rollout_audio,
+                    block=block,
+                    conditional_dict=conditional_dict,
+                )
+            else:
+                current_video, current_audio = self._run_prefix_rerun_block(
+                    prev_video=rollout_video,
+                    prev_audio=rollout_audio,
+                    block=block,
+                    conditional_dict=conditional_dict,
+                    requires_grad=is_last,
+                )
+
+            if not is_last:
+                current_video = current_video.detach()
+                if current_audio is not None:
+                    current_audio = current_audio.detach()
+
+            rollout_video = torch.cat([rollout_video, current_video], dim=1)
+            if current_audio is not None:
+                if rollout_audio is None:
+                    rollout_audio = current_audio
+                else:
+                    rollout_audio = torch.cat([rollout_audio, current_audio], dim=1)
+
+        num_audio_frames = rollout_audio.shape[1] if rollout_audio is not None else 0
+        video_loss_mask, audio_loss_mask = self._build_masks_for_blocks(
+            batch_size=rollout_video.shape[0],
+            num_video_frames=rollout_video.shape[1],
+            num_audio_frames=num_audio_frames,
+            blocks=[rollout_blocks[-1]],
+        )
+        rollout_log = {
+            "self_forcing_rollout_blocks": len(rollout_blocks),
+            "self_forcing_rollout_video_frames": rollout_video.shape[1],
+            "self_forcing_rollout_audio_frames": num_audio_frames,
+            "self_forcing_runtime": 0 if self.self_forcing_runtime == "prefix_rerun" else 1,
+        }
+        return rollout_video, rollout_audio, video_loss_mask, audio_loss_mask, rollout_log
 
     def _process_timestep(self, timestep: torch.Tensor, task_type: str) -> torch.Tensor:
         """
@@ -1312,7 +1763,7 @@ class LTX2DMD(nn.Module):
         conditional_dict: Dict[str, Any],
         clean_video: Optional[torch.Tensor] = None,
         clean_audio: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
         """
         Run generator with backward simulation.
 
@@ -1324,13 +1775,24 @@ class LTX2DMD(nn.Module):
 
         video_loss_mask = None
         audio_loss_mask = None
+        rollout_log: Dict[str, Any] = {}
+
+        if self.enable_self_forcing:
+            pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = (
+                self._run_self_forcing_rollout(
+                    clean_video=clean_video,
+                    clean_audio=clean_audio,
+                    conditional_dict=conditional_dict,
+                )
+            )
+            return pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log
 
         # Step 1: Backward simulation or ODE data
         if getattr(self.args, "backward_simulation", True):
             if self._is_causal_task(self.generator_task_type):
                 raise NotImplementedError(
                     "Causal Stage-3 DMD currently requires backward_simulation=false so training "
-                    "stays aligned with the original CausVid-style full-frame causal objective."
+                    "matches the clean-prefix/current-block-noisy inference distribution."
                 )
             video_noise = torch.randn(video_shape, device=self.device, dtype=self.dtype)
             audio_noise = torch.randn(audio_shape, device=self.device, dtype=self.dtype)
@@ -1341,6 +1803,23 @@ class LTX2DMD(nn.Module):
                 conditional_dict=conditional_dict,
             )
         else:
+            if self._is_causal_task(self.generator_task_type):
+                noisy_video, noisy_audio, video_sigma, audio_sigma, video_loss_mask, audio_loss_mask = (
+                    self._prepare_causal_generator_inputs(
+                        clean_video=clean_video,
+                        clean_audio=clean_audio,
+                    )
+                )
+                pred_video, pred_audio = self.generator(
+                    noisy_image_or_video=noisy_video,
+                    conditional_dict=conditional_dict,
+                    timestep=video_sigma,
+                    noisy_audio=noisy_audio,
+                    audio_timestep=audio_sigma,
+                    use_causal_timestep=False,
+                )
+                return pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log
+
             # Use provided clean latents
             simulated_video = []
             simulated_audio = []
@@ -1418,7 +1897,7 @@ class LTX2DMD(nn.Module):
             audio_timestep=audio_sigma,
         )
 
-        return pred_video, pred_audio, video_loss_mask, audio_loss_mask
+        return pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log
 
     def generator_loss(
         self,
@@ -1444,7 +1923,7 @@ class LTX2DMD(nn.Module):
             Tuple of (loss, log_dict)
         """
         # Run generator
-        pred_video, pred_audio, video_loss_mask, audio_loss_mask = self._run_generator(
+        pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = self._run_generator(
             video_shape=video_shape,
             audio_shape=audio_shape,
             conditional_dict=conditional_dict,
@@ -1461,6 +1940,7 @@ class LTX2DMD(nn.Module):
             video_loss_mask=video_loss_mask,
             audio_loss_mask=audio_loss_mask,
         )
+        log_dict.update(rollout_log)
 
         return dmd_loss, log_dict
 
@@ -1478,19 +1958,19 @@ class LTX2DMD(nn.Module):
 
         The critic learns to denoise generated samples.
         """
-        B = video_shape[0]
-        F_v = video_shape[1]
-        F_a = audio_shape[1]
-
         # Step 1: Generate samples (no gradient)
         with torch.no_grad():
-            generated_video, generated_audio, video_loss_mask, audio_loss_mask = self._run_generator(
+            generated_video, generated_audio, video_loss_mask, audio_loss_mask, _ = self._run_generator(
                 video_shape=video_shape,
                 audio_shape=audio_shape,
                 conditional_dict=conditional_dict,
                 clean_video=clean_video,
                 clean_audio=clean_audio,
             )
+
+        B = generated_video.shape[0]
+        F_v = generated_video.shape[1]
+        F_a = generated_audio.shape[1]
 
         # Step 2: Sample critic timestep
         if video_loss_mask is not None and audio_loss_mask is not None:

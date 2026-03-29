@@ -1,10 +1,9 @@
 """
 Causal benchmark inference pipeline for LTX-2 AV generation.
 
-This pipeline keeps the CausVid-style autoregressive outer loop semantics:
-each block is denoised from noise, conditioned on previously generated blocks.
-Since the tracked causal wrapper still does not expose a stable KV-cache runtime
-API, the implementation uses prefix-rerun instead of incremental cache updates.
+This pipeline mirrors the ODE benchmark's prefix-rerun autoregressive strategy
+instead of relying on the unfinished KV-cache runtime path in the tracked
+causal wrapper.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -16,14 +15,16 @@ from ltx_causal.attention.mask_builder import (
     compute_aligned_audio_frames,
     compute_av_blocks,
 )
+from ltx_distillation.inference.bidirectional_pipeline import BidirectionalAVInferencePipeline
+
+
 class CausalAVInferencePipeline:
     """
     Prefix-rerun autoregressive pipeline for causal AV benchmark inference.
 
     `use_kv_cache` is kept for config compatibility, but the current causal
-    wrapper does not expose a runnable KV-cache runtime API. We therefore keep
-    the CausVid-style block-by-block outer loop but realize it through
-    prefix-rerun instead of cache updates.
+    wrapper does not expose a runnable KV-cache runtime API. We therefore always
+    execute the prefix-rerun path, which matches the ODE benchmark semantics.
     """
 
     def __init__(
@@ -46,6 +47,21 @@ class CausalAVInferencePipeline:
         self.num_frame_per_block = max(1, int(num_frame_per_block))
         self.use_kv_cache_requested = bool(use_kv_cache)
         self.clear_cuda_cache_per_round = bool(clear_cuda_cache_per_round)
+
+    def _get_bootstrap_generator(self) -> nn.Module:
+        get_delegate = getattr(self.generator, "_get_bidirectional_delegate", None)
+        if callable(get_delegate):
+            delegate = get_delegate()
+            device, dtype = self._module_device_dtype(self.generator)
+            return delegate.to(device=device, dtype=dtype)
+        return self.generator
+
+    def _release_bootstrap_generator(self, bootstrap_generator: nn.Module) -> None:
+        if bootstrap_generator is self.generator:
+            return
+        bootstrap_generator.to(device="cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _module_device_dtype(module: nn.Module) -> Tuple[torch.device, torch.dtype]:
@@ -91,6 +107,20 @@ class CausalAVInferencePipeline:
             sigma,
         )
 
+    @staticmethod
+    def _merge_bootstrap_blocks(blocks):
+        if len(blocks) < 2 or blocks[0].video_frames != 1:
+            return blocks
+
+        bootstrap = type(blocks[0])(
+            block_idx=0,
+            video_start=blocks[0].video_start,
+            video_end=blocks[1].video_end,
+            audio_start=blocks[0].audio_start,
+            audio_end=blocks[1].audio_end,
+        )
+        return [bootstrap, *blocks[2:]]
+
     @torch.no_grad()
     def generate(
         self,
@@ -115,6 +145,7 @@ class CausalAVInferencePipeline:
             total_video_latent_frames=total_video_frames,
             num_frame_per_block=self.num_frame_per_block,
         )
+        blocks = self._merge_bootstrap_blocks(blocks)
 
         video = torch.zeros(video_shape, device=device, dtype=dtype)
         audio = None
@@ -134,6 +165,31 @@ class CausalAVInferencePipeline:
             audio = torch.zeros(audio_shape, device=device, dtype=dtype)
 
         for block in blocks:
+            if block.block_idx == 0:
+                bootstrap_generator = self._get_bootstrap_generator()
+                try:
+                    bootstrap_pipeline = BidirectionalAVInferencePipeline(
+                        generator=bootstrap_generator,
+                        add_noise_fn=self.add_noise_fn,
+                        denoising_sigmas=self.denoising_sigmas,
+                    )
+                    bootstrap_video_shape = (batch_size, block.video_frames, *video_shape[2:])
+                    bootstrap_audio_shape = None
+                    if audio is not None:
+                        bootstrap_audio_shape = (batch_size, block.audio_frames, audio_shape[2])
+                    current_video, current_audio = bootstrap_pipeline.generate(
+                        video_shape=bootstrap_video_shape,
+                        audio_shape=bootstrap_audio_shape,
+                        conditional_dict=conditional_dict,
+                        seed=seed,
+                    )
+                finally:
+                    self._release_bootstrap_generator(bootstrap_generator)
+                video[:, block.video_start:block.video_end] = current_video
+                if audio is not None and current_audio is not None:
+                    audio[:, block.audio_start:block.audio_end] = current_audio
+                continue
+
             current_video = torch.randn(
                 (batch_size, block.video_frames, *video_shape[2:]),
                 device=device,
