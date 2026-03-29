@@ -8,7 +8,6 @@ ltx-distillation = { workspace = true }
 members = [
     "packages/ltx-core",
     "packages/ltx-pipelines",
-    "packages/ltx-trainer",
     "packages/ltx-causal",
     "packages/ltx-distillation",
 ]
@@ -27,10 +26,7 @@ dev = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-exclude = [
-    "packages/CausVid",
-    "packages/Self-Forcing",
-]
+exclude = []
 
 [tool.ruff.lint]
 select = [
@@ -70,4 +66,4 @@ ignore = [
 max-args = 10
 
 [tool.ruff.lint.isort]
-known-first-party = ["ltx_core", "ltx_pipelines", "ltx_trainer", "ltx_causal", "ltx_distillation"]
+known-first-party = ["ltx_core", "ltx_pipelines", "ltx_causal", "ltx_distillation"]

@@ -34,8 +34,6 @@ loss_target: "x0"
 # =============================================================================
 num_frame_per_block: 3
 num_audio_sink_tokens: 16
-freeze_audio_sink_tokens: false      # Learnable sink tokens
-sink_visibility: "global"            # Global visibility
 enable_causal_log_rescale: false
 
 video_loss_weight: 1.0

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# ODE Pair Generation - 多机多卡
+# ODE Pair Generation - Multi-Node Multi-GPU
 # =============================================================================
 # Generates ODE trajectory pairs using the bidirectional teacher model.
 # Each GPU across all nodes processes a disjoint shard of prompts,
@@ -17,11 +17,11 @@
 #           ./scripts/generate_ode_pairs_multi_node.sh
 #
 # Environment Variables:
-#   NNODES       - 总节点数 (必须)
-#   NODE_RANK    - 当前节点编号，master=0 (必须)
-#   MASTER_ADDR  - master 节点 IP (必须)
-#   MASTER_PORT  - 通信端口 (默认 29501)
-#   NUM_GPUS     - 每节点 GPU 数 (默认 8)
+#   NNODES       - Total number of nodes (required)
+#   NODE_RANK    - Current node rank, master=0 (required)
+#   MASTER_ADDR  - Master node IP (required)
+#   MASTER_PORT  - Communication port (default: 29501)
+#   NUM_GPUS     - GPUs per node (default: 8)
 #
 # =============================================================================
 
@@ -36,7 +36,7 @@ if [ -n "${VENV_PATH:-}" ] && [ -f "${VENV_PATH}/bin/activate" ]; then
 fi
 
 # =============================================================================
-# 检查必要的环境变量
+# Check required environment variables
 # =============================================================================
 if [ -z "$NNODES" ]; then
     echo "Error: NNODES not set."

@@ -149,14 +149,19 @@ class LTX2DMD(nn.Module):
         # Two-phase: if audio_start_step > 0, audio_loss_weight=0 until that step
         self.audio_start_step = getattr(args, "audio_start_step", 0)
 
-        # Denoising sigmas from LTX-2's native scheduler (shifted + stretched).
-        # Number of denoising steps = len(denoising_step_list) - 1
-        # (the list includes both start=1.0 and end=0.0, so 4 entries = 3 steps)
-        # This matches the sigma schedule used in ODE pair generation and inference.
-        num_denoising_steps = len(args.denoising_step_list) - 1
-        self.denoising_sigmas = LTX2Scheduler().execute(
-            steps=num_denoising_steps
-        ).to(device)
+        # Denoising sigmas aligned with ODE pair generation.
+        # ODE pairs are generated with a fine-grained schedule (e.g. 40 steps)
+        # then subsampled to denoising_step_list by finding the closest sigma.
+        # We replicate that logic here so Stage 1/3 DMD training uses the exact
+        # same sigma values as the ODE trajectories stored in LMDB.
+        _ode_num_steps = getattr(args, "num_inference_steps", 40)
+        _full_sigmas = LTX2Scheduler().execute(steps=_ode_num_steps)
+        _denoising_sigmas = []
+        for t in args.denoising_step_list:
+            target_sigma = t / 1000.0
+            idx = (_full_sigmas - target_sigma).abs().argmin().item()
+            _denoising_sigmas.append(_full_sigmas[idx])
+        self.denoising_sigmas = torch.stack(_denoising_sigmas).to(device)
 
         # Pre-compute sigma lookup table for random timestep → sigma conversion.
         # This matches CausVid's approach where scheduler.add_noise() internally

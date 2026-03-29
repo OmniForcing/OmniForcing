@@ -13,15 +13,13 @@
 
 </div>
 
-**OmniForcing** is the first framework to distill an offline, bidirectional joint audio-visual diffusion model into a **real-time streaming autoregressive generator**. Built on top of LTX-2 (14B video + 5B audio), OmniForcing achieves **~25 FPS** streaming on a single GPU with a Time-To-First-Chunk of only **~0.7s** -- a **~35x speedup** over the teacher -- while maintaining visual and acoustic fidelity on par with the bidirectional teacher model.
+**OmniForcing** is the first framework to distill an offline, bidirectional joint audio-visual diffusion model into a **real-time streaming autoregressive generator**. Built on top of LTX-2 (14B video + 5B audio), OmniForcing achieves streaming t2av generation while maintaining visual and acoustic fidelity on par with the bidirectional teacher model.
 
 
 ## News
 
-- **[2026/03]** Training code and data processing pipeline open-sourced.
+- **[2026/03]** Full training code and data processing pipeline open-sourced.
 - **[2026/03]** Paper released on [arXiv 2603.11647](https://arxiv.org/abs/2603.11647). Project page is live at [OmniForcing.com](https://omniforcing.com).
-
-> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon.
 
 
 ## Method Overview
@@ -36,11 +34,9 @@ OmniForcing employs a **three-stage distillation pipeline** to progressively tra
 
 - **Stage 2 -- Causal ODE Regression:** The model is equipped with our **Asymmetric Block-Causal Mask** and trained via ODE trajectory regression to adapt to causal attention. An **Audio Sink Token** mechanism with **Identity RoPE** is introduced to resolve the Softmax collapse and gradient explosion caused by extreme audio token sparsity.
 
-- **Stage 3 -- Joint Causal DMD:** The model is trained with DMD loss in causal mode. Two variants are provided:
-  - **Causal DMD** (main branch): Block-wise DMD training with bidirectional teacher/critic.
-  - **Self-Forcing DMD** (`self-forcing` branch): Autoregressive self-forcing rollout that enables the model to dynamically self-correct cumulative cross-modal errors from exposure bias.
-
-At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step context complexity to O(L) and enables concurrent execution of the video and audio streams, achieving real-time synchronized generation.
+- **Stage 3 -- Joint Self-Forcing DMD:** The model autoregressively unrolls its own generations during training, enabling dynamic self-correction of cumulative cross-modal errors from exposure bias. Two variants are provided:
+  - **Self-Forcing DMD** (`main` branch): Autoregressive self-forcing rollout with DMD loss (recommended).
+  - **Causal DMD** (`causal-dmd` branch): Block-wise DMD training without self-forcing rollout.
 
 ## Results & Demos
 
@@ -93,15 +89,18 @@ At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step 
 
 - Python >= 3.10
 - PyTorch >= 2.2.0
-- 8x or 32x GPUs (A100/H100 recommended)
+- 8x or 32x GPUs with 96GB+ memory (H200 recommended). Causal DMD branch may work on lower-memory GPUs.
 
 ### Installation
 
 ```bash
-git clone https://github.com/YourOrg/OmniForcing.git
+git clone https://github.com/OmniForcing/OmniForcing.git
 cd OmniForcing/LTX-2
 
-# Install packages (editable mode recommended)
+# Install with uv (recommended)
+uv sync
+
+# Or install with pip
 pip install -e packages/ltx-core
 pip install -e packages/ltx-pipelines
 pip install -e packages/ltx-causal
@@ -110,17 +109,19 @@ pip install -e packages/ltx-distillation
 
 ### Download Models
 
-Download the following pretrained models:
+Download the following pretrained models and update the paths in the config files:
 
 | Model | Description |
 |-------|-------------|
-| [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-Video-2) | LTX-2 base model (19B) |
-| [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-12b-it) | Gemma text encoder |
+| `ltx-2-19b-dev.safetensors` | LTX-2 base model (19B), from [Lightricks/LTX-2](https://huggingface.co/collections/Lightricks/ltx-2) |
+| `gemma-3-12b-it-qat-q4_0-unquantized` | Gemma 3 12B text encoder (unquantized QAT variant) |
 
-Update the paths in the config files to point to your downloaded models.
+
 
 
 ## Training Pipeline
+
+> **Note:** Support for LTX-2.3, improved inference pipeline, and future new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
 
 The training follows a three-stage pipeline. We recommend **32 GPUs** (4 nodes x 8 GPUs) for optimal performance. You can also train with **8 GPUs** by setting `gradient_accumulation_steps: 4` in the config.
 
@@ -131,15 +132,15 @@ Distills the LTX-2 teacher model from 1000-step to 4-step inference while preser
 **Data preparation:** Prepare a text prompts file (one prompt per line). You can use our prompt enhancement tools to expand short captions into detailed LTX-2 prompts:
 
 ```bash
-# Option A: Using vLLM + any LLM (recommended)
 cd LTX-2/packages/pe
-# First start a vLLM server with your preferred LLM
-# vllm serve /path/to/your/llm --tensor-parallel-size 8
+
+# Option A: Heavy mode - vLLM + LLM (recommended, higher quality)
+# First start a vLLM server with your preferred LLM:
+#   vllm serve /path/to/your/llm --tensor-parallel-size 8
 python batch_enhance.py captions.txt --duration 5s
 
-# Option B: Using local Gemma model
-cd LTX-2/packages
-python enhance_prompts.py --input captions.txt --output prompts.txt
+# Option B: Light mode - local Gemma via vLLM (simpler, faster)
+python enhance_prompts_light.py --input captions.txt --output prompts.txt
 ```
 
 **Training:**
@@ -197,20 +198,20 @@ Two variants are available:
 
 | Variant | Branch | Description |
 |---------|--------|-------------|
-| **Causal DMD** | `main` | Block-wise DMD training with bidirectional teacher/critic |
-| **Self-Forcing DMD** | `self-forcing` | Autoregressive rollout for exposure bias correction |
+| **Self-Forcing DMD** | `main` | Autoregressive self-forcing rollout with DMD loss (recommended) |
+| **Causal DMD** | `causal-dmd` | Block-wise DMD training without self-forcing rollout |
 
-**Training (Causal DMD):**
+**Training (Self-Forcing DMD, default):**
 
 ```bash
 # Edit configs/stage3_causal_dmd.yaml with your paths, then:
 ./scripts/train_stage3_causal_dmd.sh
 ```
 
-**Training (Self-Forcing DMD):**
+**Training (Causal DMD, alternative):**
 
 ```bash
-git checkout self-forcing
+git checkout causal-dmd
 ./scripts/train_stage3_causal_dmd.sh
 ```
 
@@ -256,8 +257,11 @@ OmniForcing/
         │       ├── inference/               # Benchmark pipelines
         │       └── models/                  # Model wrappers
         ├── ltx-pipelines/               # Inference pipeline utilities
-        ├── pe/                          # Prompt enhancement (vLLM-based)
-        └── enhance_prompts.py           # Prompt enhancement (API-based)
+        └── pe/                          # Prompt enhancement tools
+            ├── batch_enhance.py         # Heavy mode (vLLM + LLM, higher quality)
+            ├── prompt_enhancer.py       # Heavy mode core (duration-aware)
+            ├── enhance_prompts_light.py # Light mode (simpler, faster)
+            └── light_system_prompt.txt  # Light mode system prompt
 ```
 
 
