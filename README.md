@@ -127,7 +127,7 @@ The training follows a three-stage pipeline. We recommend **32 GPUs** (4 nodes x
 
 ### Stage 1: Bidirectional DMD
 
-Distills the LTX-2 teacher model from 1000-step to 4-step inference while preserving global attention.
+Distills the LTX-2 teacher model from multi-step to 4-step inference while preserving global attention.
 
 **Data preparation:** Prepare a text prompts file (one prompt per line). You can use our prompt enhancement tools to expand short captions into detailed LTX-2 prompts:
 
