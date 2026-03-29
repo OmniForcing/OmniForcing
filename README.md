@@ -13,7 +13,7 @@
 
 </div>
 
-**OmniForcing** is the first framework to distill an offline, bidirectional joint audio-visual diffusion model into a **real-time streaming autoregressive generator**. Built on top of LTX-2 (14B video + 5B audio), OmniForcing achieves **~25 FPS** streaming on a single GPU with a Time-To-First-Chunk of only **~0.7s** -- a **~35x speedup** over the teacher -- while maintaining visual and acoustic fidelity on par with the bidirectional teacher model.
+**OmniForcing** is the first framework to distill an offline, bidirectional joint audio-visual diffusion model into a **real-time streaming autoregressive generator**. Built on top of LTX-2 (14B video + 5B audio), OmniForcing achieves streaming t2av generation while maintaining visual and acoustic fidelity on par with the bidirectional teacher model.
 
 
 ## News
@@ -37,8 +37,6 @@ OmniForcing employs a **three-stage distillation pipeline** to progressively tra
 - **Stage 3 -- Joint Self-Forcing DMD:** The model autoregressively unrolls its own generations during training, enabling dynamic self-correction of cumulative cross-modal errors from exposure bias. Two variants are provided:
   - **Self-Forcing DMD** (`main` branch): Autoregressive self-forcing rollout with DMD loss (recommended).
   - **Causal DMD** (`causal-dmd` branch): Block-wise DMD training without self-forcing rollout.
-
-At inference time, a **Modality-Independent Rolling KV-Cache** reduces per-step context complexity to O(L) and enables concurrent execution of the video and audio streams, achieving real-time synchronized generation.
 
 ## Results & Demos
 
@@ -115,13 +113,15 @@ Download the following pretrained models and update the paths in the config file
 
 | Model | Description |
 |-------|-------------|
-| `ltx-2-19b-dev.safetensors` | LTX-2 base model (19B), from [Lightricks/LTX-Video-2](https://huggingface.co/Lightricks/LTX-Video-2) |
+| `ltx-2-19b-dev.safetensors` | LTX-2 base model (19B), from [Lightricks/LTX-2](https://huggingface.co/collections/Lightricks/ltx-2) |
 | `gemma-3-12b-it-qat-q4_0-unquantized` | Gemma 3 12B text encoder (unquantized QAT variant) |
 
-> **Note:** The current implementation includes optimized mask designs compared to the paper. Support for LTX-2.3, improved inference pipeline, and future new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
+
 
 
 ## Training Pipeline
+
+> **Note:** Support for LTX-2.3, improved inference pipeline, and future new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
 
 The training follows a three-stage pipeline. We recommend **32 GPUs** (4 nodes x 8 GPUs) for optimal performance. You can also train with **8 GPUs** by setting `gradient_accumulation_steps: 4` in the config.
 
