@@ -29,6 +29,7 @@ class ODEAutoregressiveBenchmarkPipeline:
         add_noise_fn,
         denoising_sigmas: torch.Tensor,
         num_frame_per_block: int = 3,
+        num_frame_per_block_first: int = 4,
         clear_cuda_cache_per_round: bool = True,
     ):
         if denoising_sigmas.ndim != 1 or denoising_sigmas.numel() < 2:
@@ -40,6 +41,7 @@ class ODEAutoregressiveBenchmarkPipeline:
         self.add_noise_fn = add_noise_fn
         self.denoising_sigmas = denoising_sigmas
         self.num_frame_per_block = max(1, int(num_frame_per_block))
+        self.num_frame_per_block_first = max(1, int(num_frame_per_block_first))
         self.clear_cuda_cache_per_round = bool(clear_cuda_cache_per_round)
 
     def _get_bootstrap_generator(self) -> nn.Module:
@@ -138,8 +140,8 @@ class ODEAutoregressiveBenchmarkPipeline:
         blocks = compute_av_blocks(
             total_video_latent_frames=total_video_frames,
             num_frame_per_block=self.num_frame_per_block,
+            num_frame_per_block_first=self.num_frame_per_block_first,
         )
-        blocks = self._merge_bootstrap_blocks(blocks)
 
         video = torch.zeros(video_shape, device=device, dtype=dtype)
         audio = None
@@ -150,6 +152,7 @@ class ODEAutoregressiveBenchmarkPipeline:
             expected_audio_frames = compute_aligned_audio_frames(
                 total_video_latent_frames=total_video_frames,
                 num_frame_per_block=self.num_frame_per_block,
+                num_frame_per_block_first=self.num_frame_per_block_first,
             )
             if audio_shape[1] != expected_audio_frames:
                 raise ValueError(

@@ -97,7 +97,19 @@ class ODEGenerationConfig:
     num_inference_steps: int = 40
     video_guidance_scale: float = 3.0   # LTX-2 native default for video
     audio_guidance_scale: float = 7.0   # LTX-2 native default for audio
-    denoising_step_list: List[int] = field(default_factory=lambda: [1000, 757, 522, 0])
+    # STG (Spatio-Temporal Guidance): matches official LTX-2 pipeline defaults
+    stg_scale: float = 1.0
+    stg_blocks: List[int] = field(default_factory=lambda: [29])
+    # Modality-scale CFG: cross-modal guidance (official default = 3.0)
+    modality_scale: float = 3.0
+    # Rescale factor for CFG (official default = 0.7)
+    rescale_scale: float = 0.7
+    # 4-step sigma schedule (5 points = 4 noisy + 1 clean). Matches Stage 2
+    # ODE-regression and Stage 3 Self-Forcing DMD's `denoising_step_list`.
+    # Each ODE trajectory stored in LMDB has T=5 steps at these sigmas, so the
+    # training distribution is perfectly aligned between LMDB samples and the
+    # generator's per-block denoising loop at training time.
+    denoising_step_list: List[int] = field(default_factory=lambda: [1000, 909, 725, 421, 0])
 
     # Negative prompt for CFG (matches LTX-2 official DEFAULT_NEGATIVE_PROMPT)
     negative_prompt: str = (
@@ -145,7 +157,7 @@ class LTX2ODEPairGenerator(nn.Module):
         self._scheduler = None
 
     def _load_models(self, device: torch.device):
-        """Load teacher model and text encoder."""
+        """Load teacher model, text encoder, and (optionally) VAE for preview."""
         if self._teacher is not None:
             return
 
@@ -155,6 +167,7 @@ class LTX2ODEPairGenerator(nn.Module):
 
         from ltx_distillation.models.ltx_wrapper import create_ltx2_wrapper
         from ltx_distillation.models.text_encoder_wrapper import create_text_encoder_wrapper
+        from ltx_distillation.models.vae_wrapper import create_vae_wrappers
         from ltx_core.components.schedulers import LTX2Scheduler
 
         self._text_encoder = create_text_encoder_wrapper(
@@ -172,6 +185,14 @@ class LTX2ODEPairGenerator(nn.Module):
             video_width=self.config.video_width,
         )
         self._teacher.eval()
+
+        # VAE for saving preview video/audio
+        self._video_vae, self._audio_vae = create_vae_wrappers(
+            checkpoint_path=self.config.teacher_checkpoint,
+            device=device,
+        )
+        self._video_vae.eval()
+        self._audio_vae.eval()
 
         # Use LTX-2's native scheduler (sigmoid shift + stretch) for generating
         # the denoising sigma schedule. This matches the original inference pipeline.
@@ -249,26 +270,90 @@ class LTX2ODEPairGenerator(nn.Module):
             print(f"  last 5:  {sigmas[-5:].tolist()}")
             self._sigmas_logged = True
 
+        from ltx_core.guidance.perturbations import (
+            BatchedPerturbationConfig,
+            PerturbationConfig,
+            Perturbation,
+            PerturbationType,
+        )
+
+        v_cfg = self.config.video_guidance_scale
+        a_cfg = self.config.audio_guidance_scale
+        v_stg = self.config.stg_scale
+        a_stg = self.config.stg_scale
+        v_mod = self.config.modality_scale
+        a_mod = self.config.modality_scale
+        rescale = self.config.rescale_scale
+        stg_blocks = self.config.stg_blocks
+
+        # Build perturbation configs once
+        stg_perturbations = PerturbationConfig(perturbations=[
+            Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks),
+            Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks),
+        ])
+        stg_batch = BatchedPerturbationConfig(perturbations=[stg_perturbations])
+        mod_perturbations = PerturbationConfig(perturbations=[
+            Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+            Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+        ])
+        mod_batch = BatchedPerturbationConfig(perturbations=[mod_perturbations])
+
         for i in range(len(sigmas) - 1):
             sigma = sigmas[i]
             sigma_tensor = sigma * torch.ones([1], device=device, dtype=dtype)
 
+            # Pass 1: conditional (positive)
             video_x0_cond, audio_x0_cond = self._teacher(
                 noisy_image_or_video=video,
                 conditional_dict=conditional_dict,
                 timestep=sigma_tensor,
                 noisy_audio=audio,
             )
+            # Pass 2: unconditional (text CFG negative)
             video_x0_uncond, audio_x0_uncond = self._teacher(
                 noisy_image_or_video=video,
                 conditional_dict=unconditional_dict,
                 timestep=sigma_tensor,
                 noisy_audio=audio,
             )
+            # Pass 3: STG perturbed (skip self-attn in stg_blocks)
+            video_x0_ptb, audio_x0_ptb = self._teacher(
+                noisy_image_or_video=video,
+                conditional_dict=conditional_dict,
+                timestep=sigma_tensor,
+                noisy_audio=audio,
+                perturbations=stg_batch,
+            )
+            # Pass 4: modality-isolated (skip A2V + V2A cross-attn)
+            video_x0_mod, audio_x0_mod = self._teacher(
+                noisy_image_or_video=video,
+                conditional_dict=conditional_dict,
+                timestep=sigma_tensor,
+                noisy_audio=audio,
+                perturbations=mod_batch,
+            )
 
-            # CFG (LTX-2 uses different scales for video and audio)
-            video_x0 = video_x0_uncond + self.config.video_guidance_scale * (video_x0_cond - video_x0_uncond)
-            audio_x0 = audio_x0_uncond + self.config.audio_guidance_scale * (audio_x0_cond - audio_x0_uncond)
+            # Full MultiModalGuider formula (matches official pipeline):
+            #   pred = cond + (cfg-1)*(cond-uncond) + stg*(cond-ptb) + (mod-1)*(cond-mod_isolated)
+            video_x0 = (
+                video_x0_cond
+                + (v_cfg - 1) * (video_x0_cond - video_x0_uncond)
+                + v_stg * (video_x0_cond - video_x0_ptb)
+                + (v_mod - 1) * (video_x0_cond - video_x0_mod)
+            )
+            audio_x0 = (
+                audio_x0_cond
+                + (a_cfg - 1) * (audio_x0_cond - audio_x0_uncond)
+                + a_stg * (audio_x0_cond - audio_x0_ptb)
+                + (a_mod - 1) * (audio_x0_cond - audio_x0_mod)
+            )
+
+            # CFG* rescale: normalise guided prediction to match cond's std
+            if rescale > 0:
+                v_factor = video_x0_cond.float().std() / video_x0.float().std().clamp(min=1e-8)
+                video_x0 = video_x0 * (rescale * v_factor + (1 - rescale))
+                a_factor = audio_x0_cond.float().std() / audio_x0.float().std().clamp(min=1e-8)
+                audio_x0 = audio_x0 * (rescale * a_factor + (1 - rescale))
 
             # Euler step: x_{t+1} = x_t + velocity * dt
             # velocity = (x_t - x_0) / sigma
@@ -303,12 +388,54 @@ class LTX2ODEPairGenerator(nn.Module):
             audio_trajectory = audio_trajectory[:, indices]
             sigmas_trajectory = sigmas_trajectory[indices]
 
+        # Final clean latent (last entry in trajectory = sigma≈0)
+        clean_video_latent = video_trajectory[:, -1]   # [1, F, C, H, W]
+        clean_audio_latent = audio_trajectory[:, -1]   # [1, F_a, C]
+
         return {
             "prompt": prompt,
             "video_trajectory": video_trajectory,
             "audio_trajectory": audio_trajectory,
             "sigmas": sigmas_trajectory.cpu(),  # [T] actual sigma values for each trajectory entry
+            "clean_video_latent": clean_video_latent,   # for preview decode
+            "clean_audio_latent": clean_audio_latent,
         }
+
+    @torch.no_grad()
+    def _save_preview(
+        self,
+        trajectory: Dict[str, Any],
+        output_path: str,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Decode the clean (sigma=0) latent and save as .mp4 with audio."""
+        try:
+            from ltx_pipelines.utils.encode_video import encode_video
+        except ImportError:
+            # Fallback: save video frames as a grid image
+            return
+
+        clean_video = trajectory["clean_video_latent"].to(device=device, dtype=dtype)
+        clean_audio = trajectory["clean_audio_latent"].to(device=device, dtype=dtype)
+
+        # Decode video: [1, F, C, H, W] -> pixel [1, C_out, F_out, H_out, W_out] in [-1,1]
+        pixel_video = self._video_vae.decode(clean_video)
+        pixel_video = (pixel_video + 1) / 2  # normalise to [0, 1]
+        pixel_video = pixel_video.clamp(0, 1)
+
+        # Decode audio: [1, F_a, C] -> waveform [1, 1, samples]
+        waveform = self._audio_vae.decode_to_waveform(clean_audio)
+
+        mp4_path = output_path.replace(".pt", ".mp4")
+        encode_video(
+            video=pixel_video,
+            fps=24.0,
+            audio=waveform,
+            audio_sample_rate=24000,
+            output_path=mp4_path,
+            video_chunks_number=1,
+        )
 
     def _compute_subsample_indices(
         self,
@@ -400,6 +527,13 @@ class LTX2ODEPairGenerator(nn.Module):
                 torch.save(trajectory, output_path)
                 generated += 1
 
+                # Save .mp4 preview for quality inspection
+                try:
+                    self._save_preview(trajectory, output_path, device, dtype)
+                except Exception as preview_err:
+                    if rank == 0:
+                        print(f"[rank {rank}] Preview save failed for {prompt_idx}: {preview_err}")
+
             except Exception as e:
                 print(f"[rank {rank}] Error generating prompt {prompt_idx}: {e}")
                 continue
@@ -433,6 +567,8 @@ def main():
                         help="CFG scale for video (LTX-2 native default: 3.0)")
     parser.add_argument("--audio_guidance_scale", type=float, default=7.0,
                         help="CFG scale for audio (LTX-2 native default: 7.0)")
+    parser.add_argument("--rescale_scale", type=float, default=0.7,
+                        help="CFG rescale factor (LTX-2 native default: 0.7)")
     parser.add_argument("--negative_prompt", type=str, default=None,
                         help="Negative prompt for CFG (default: LTX-2 official)")
     parser.add_argument("--no_skip_existing", action="store_true",
@@ -471,6 +607,7 @@ def main():
         num_inference_steps=args.num_inference_steps,
         video_guidance_scale=args.video_guidance_scale,
         audio_guidance_scale=args.audio_guidance_scale,
+        rescale_scale=args.rescale_scale,
     )
     if args.negative_prompt is not None:
         config_kwargs["negative_prompt"] = args.negative_prompt

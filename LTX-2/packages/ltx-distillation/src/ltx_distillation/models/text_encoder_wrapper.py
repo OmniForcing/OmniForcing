@@ -95,6 +95,7 @@ def create_text_encoder_wrapper(
     gemma_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    registry=None,
 ) -> GemmaTextEncoderWrapper:
     """
     Factory function to create GemmaTextEncoderWrapper from checkpoint.

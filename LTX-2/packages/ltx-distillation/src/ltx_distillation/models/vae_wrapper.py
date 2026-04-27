@@ -191,6 +191,7 @@ def create_vae_wrappers(
     checkpoint_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    registry=None,
 ) -> tuple[VideoVAEWrapper, AudioVAEWrapper]:
     """
     Factory function to create VAE wrappers from checkpoint.

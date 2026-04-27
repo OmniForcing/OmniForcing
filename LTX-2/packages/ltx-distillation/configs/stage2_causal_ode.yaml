@@ -1,20 +1,15 @@
 # =============================================================================
 # Stage 2: Causal ODE Regression Initialization
 # =============================================================================
-# Converts bidirectional model to causal autoregressive using ODE trajectories.
-# Uses global-visibility learnable sink tokens for audio-video alignment.
-#
-# Prerequisites:
-#   - Stage 1 bidirectional DMD checkpoint
-#   - ODE trajectory LMDB dataset (see data preparation in README)
+# Converts bidirectional LTX-2 to causal autoregressive using ODE trajectories.
+# Directly loads ltx-2-19b-dev.safetensors as starting point (no Stage 1 needed).
 
 # =============================================================================
-# Model Paths (UPDATE THESE TO YOUR LOCAL PATHS)
+# Model Paths
 # =============================================================================
 checkpoint_path: /path/to/checkpoints/ltx-2-19b-dev.safetensors
 causal_model_checkpoint: null
-# Stage 1 output checkpoint
-bidirectional_model_checkpoint: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
+bidirectional_model_checkpoint: null
 text_encoder_checkpoint: /path/to/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
 
 # =============================================================================
@@ -24,7 +19,13 @@ generator_task: causal_video
 distillation_loss: ode
 disable_causal_mask: false
 
-denoising_step_list: [1000, 757, 522, 0]
+# Aligned with ODE pair generation and Stage-3 DMD.
+# 4-step denoising (5 sigma points including clean endpoint) — unified with Stage-3 self-forcing.
+denoising_step_list: [1000, 909, 725, 421, 0]
+
+# 8-step denoising (full LTX-2 distilled schedule, 9 sigma points).
+# Uncomment below and comment out the 4-step list above to use 8 steps:
+# denoising_step_list: [1000, 993, 987, 981, 975, 909, 725, 421, 0]
 init_mode: "pretrained"
 uniform_timestep: false
 loss_target: "x0"
@@ -32,13 +33,19 @@ loss_target: "x0"
 # =============================================================================
 # Causal Architecture Settings
 # =============================================================================
+# 4-3-3-3-... block layout (16 video = 4+4*3, 126 audio = 26+4*25).
 num_frame_per_block: 3
-num_audio_sink_tokens: 16
+num_frame_per_block_first: 4
 enable_causal_log_rescale: false
 
 video_loss_weight: 1.0
-audio_loss_weight: 0.16
+audio_loss_weight: 1.0
 skip_cross_modal_attention: false
+
+# Context noise for KV-cache benchmark inference (matches Stage-3 setting).
+# Not used during ODE regression training itself, only during periodic benchmarks.
+context_noise: 0
+num_train_timestep: 1000
 
 # =============================================================================
 # Training Configuration
@@ -46,19 +53,19 @@ skip_cross_modal_attention: false
 mixed_precision: true
 gradient_checkpointing: true
 batch_size: 1
-lr: 2.0e-05
+lr: 2.0e-04
 beta1: 0.9
 beta2: 0.999
 weight_decay: 0.0
-max_grad_norm: 10.0
-gradient_accumulation_steps: 2
-warmup_steps: 100
+max_grad_norm: 1.0
+gradient_accumulation_steps: 1
+warmup_steps: 0
+max_steps: 1000000
 
 # =============================================================================
 # Data Configuration
 # =============================================================================
-# Path to ODE LMDB dataset (created by create_ode_lmdb.sh)
-data_path: /path/to/data/ode_lmdb
+data_path: ./ode_lmdb_4step_512
 max_pair: 1000000
 load_audio: true
 num_workers: 8
@@ -75,20 +82,23 @@ min_num_params: 100000000
 # Logging and Checkpointing
 # =============================================================================
 output_path: ./outputs/stage2_causal_ode
-log_iters: 100
+log_iters: 10
+visualize_iters: 100
+save_iters: 500
 benchmark_enabled: true
-benchmark_iters: 100
-benchmark_num_prompts: 16
+benchmark_iters: 500
+benchmark_prompt_file: ./prompts/benchmark_8.txt
+benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24
 benchmark_audio_sample_rate: 24000
 benchmark_num_frame_per_block: 3
 benchmark_clear_cuda_cache_per_round: true
 
-wandb_project: OmniForcing
-wandb_entity: your-wandb-entity
+wandb_project: omniforcing-debug
+wandb_entity: 547634227-peking-university
 wandb_name: stage2_causal_ode
-# wandb_api_key: "your-wandb-api-key"
+wandb_api_key: "your-wandb-api-key"
 
 seed: 42
 no_save: false

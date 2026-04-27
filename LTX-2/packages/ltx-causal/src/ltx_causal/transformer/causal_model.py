@@ -15,7 +15,7 @@ Based on LTX-2's LTXModel architecture (ltx_core/model/transformer/model.py).
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -89,11 +89,10 @@ class CausalLTXModelConfig:
     # Normalization
     norm_eps: float = 1e-6
 
-    # Causal generation
+    # Causal generation: 4-3-3-3-... layout (Block 0 = 4 video frames + 26 audio,
+    # subsequent blocks = 3 video + 25 audio).
     num_frame_per_block: int = 3
-
-    # Audio sink tokens
-    num_audio_sink_tokens: int = 0
+    num_frame_per_block_first: int = 4
 
     # RoPE
     rope_type: CausalRopeType = CausalRopeType.INTERLEAVED
@@ -225,19 +224,12 @@ class CausalLTXModel(nn.Module):
         )
         self.audio_proj_out = nn.Linear(config.audio_dim, config.out_channels)
 
-        # === Audio Sink Tokens ===
-        if config.num_audio_sink_tokens > 0:
-            self.audio_sink_tokens = nn.Parameter(
-                torch.zeros(1, config.num_audio_sink_tokens, config.audio_dim)
-            )
-            nn.init.normal_(self.audio_sink_tokens, std=0.02)
-
         # === Mask Builder ===
         self.mask_builder = AVCausalMaskBuilder(
             video_frame_seqlen=config.video_frame_seqlen,
             audio_frame_seqlen=config.audio_frame_seqlen,
             num_frame_per_block=config.num_frame_per_block,
-            num_audio_sink_tokens=config.num_audio_sink_tokens,
+            num_frame_per_block_first=config.num_frame_per_block_first,
         )
 
         # Gradient checkpointing
@@ -410,9 +402,19 @@ class CausalLTXModel(nn.Module):
         audio_context_mask: Optional[torch.Tensor] = None,
         audio_timesteps: Optional[torch.Tensor] = None,
         masks: Optional[Dict[str, Any]] = None,
+        # KV-cache path: when provided, dispatches to the incremental
+        # forward_with_cache codepath. This MUST go through forward() so
+        # that FSDP pre/post-forward hooks fire and unshard parameters.
+        kv_caches: Optional[List[Dict[str, Any]]] = None,
+        current_video_start_frame: int = 0,
+        current_audio_start_frame: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass (training only).
+        Forward pass.
+
+        When ``kv_caches`` is provided, dispatches to the per-block KV-cache
+        path (``forward_with_cache``). Otherwise runs the full-sequence path
+        with optional block masks for causal training.
 
         Args:
             video_latent: [B, F_v, C, H, W] video latent
@@ -428,6 +430,22 @@ class CausalLTXModel(nn.Module):
         Returns:
             (video_velocity, audio_velocity): Velocity predictions
         """
+        # === KV-cache dispatch (MUST go through forward() for FSDP) ===
+        if kv_caches is not None:
+            return self.forward_with_cache(
+                video_latent=video_latent,
+                audio_latent=audio_latent,
+                timesteps=timesteps,
+                video_context=video_context,
+                audio_context=audio_context,
+                kv_caches=kv_caches,
+                current_video_start_frame=current_video_start_frame,
+                current_audio_start_frame=current_audio_start_frame,
+                video_context_mask=video_context_mask,
+                audio_context_mask=audio_context_mask,
+                audio_timesteps=audio_timesteps,
+            )
+
         B = video_latent.shape[0]
         device = video_latent.device
         hidden_dtype = video_latent.dtype
@@ -444,12 +462,6 @@ class CausalLTXModel(nn.Module):
         audio_x = self.audio_patchify_proj(audio_latent)
         F_a_original = audio_x.shape[1]
         audio_grid_sizes = torch.tensor([F_a_original], device=device).unsqueeze(0)
-
-        # === Prepend Audio Sink Tokens ===
-        num_sink = self.config.num_audio_sink_tokens
-        if num_sink > 0:
-            sink_expanded = self.audio_sink_tokens.expand(B, -1, -1).to(audio_x.dtype)
-            audio_x = torch.cat([sink_expanded, audio_x], dim=1)
 
         # === Context Projection ===
         video_ctx = self._prepare_context(
@@ -473,23 +485,9 @@ class CausalLTXModel(nn.Module):
         # Audio timestep (defaults to video timestep if not provided)
         audio_ts = audio_timesteps if audio_timesteps is not None else timesteps
 
-        # Expand audio timestep with sink entries (same as first frame's timestep)
-        if num_sink > 0 and audio_ts.ndim == 2:
-            # audio_ts is [B, F_a], prepend num_sink copies of first frame's value
-            sink_ts = audio_ts[:, :1].expand(-1, num_sink)  # [B, num_sink]
-            audio_ts_expanded = torch.cat([sink_ts, audio_ts], dim=1)  # [B, num_sink + F_a]
-        else:
-            audio_ts_expanded = audio_ts
-
-        # Save original audio embedded timestep (without sinks) for output
-        audio_timestep_6d, audio_embedded_ts_full = self._prepare_timestep(
-            audio_ts_expanded, self.audio_adaln_single, B, hidden_dtype
+        audio_timestep_6d, audio_embedded_ts = self._prepare_timestep(
+            audio_ts, self.audio_adaln_single, B, hidden_dtype
         )
-        # Strip sink entries from embedded timestep for output processing
-        if num_sink > 0 and audio_embedded_ts_full.shape[1] > 1:
-            audio_embedded_ts = audio_embedded_ts_full[:, num_sink:]
-        else:
-            audio_embedded_ts = audio_embedded_ts_full
 
         # === Cross-Attention Timesteps ===
         video_cross_ss, video_cross_gate = self._prepare_cross_attention_timestep(
@@ -499,7 +497,7 @@ class CausalLTXModel(nn.Module):
             B, hidden_dtype,
         )
         audio_cross_ss, audio_cross_gate = self._prepare_cross_attention_timestep(
-            audio_ts_expanded,
+            audio_ts,
             self.av_ca_audio_scale_shift_adaln_single,
             self.av_ca_v2a_gate_adaln_single,
             B, hidden_dtype,
@@ -517,15 +515,14 @@ class CausalLTXModel(nn.Module):
         video_cross_gate = self._expand_per_frame_to_per_token(video_cross_gate, frame_seqlen)
 
         # Reuse wrapper-provided masks whenever available. The wrapper already
-        # builds them with num_audio_sink_tokens=num_sink, so sink tokens do not
-        # require an unconditional rebuild here.
+        # builds them with the correct num_frame_per_block_first.
         if masks is None:
             num_video_frames = video_grid_sizes[0, 0].item()
-            num_audio_frames = audio_grid_sizes[0, 0].item()  # Original count (without sinks)
+            num_audio_frames = audio_grid_sizes[0, 0].item()
             mask_config = CausalMaskConfig(
                 video_frame_seqlen=self.config.video_frame_seqlen,
                 num_frame_per_block=self.config.num_frame_per_block,
-                num_audio_sink_tokens=num_sink,
+                num_frame_per_block_first=self.config.num_frame_per_block_first,
             )
             masks = build_all_causal_masks(
                 num_video_frames, num_audio_frames,
@@ -537,14 +534,15 @@ class CausalLTXModel(nn.Module):
         log_scales = None
         if self.config.enable_causal_log_rescale:
             blocks = compute_av_blocks(
-                F_v, self.config.num_frame_per_block,
+                F_v,
+                num_frame_per_block=self.config.num_frame_per_block,
+                num_frame_per_block_first=self.config.num_frame_per_block_first,
             )
             log_scales = compute_causal_log_scales(
                 blocks,
                 video_frame_seqlen=self.config.video_frame_seqlen,
                 audio_frame_seqlen=self.config.audio_frame_seqlen,
                 device=device,
-                num_audio_sink_tokens=num_sink,
             )
 
         # === Precompute RoPE ===
@@ -562,16 +560,6 @@ class CausalLTXModel(nn.Module):
             device=device, dtype=audio_x.dtype,
             is_audio=True,
         )
-
-        # Prepend identity RoPE for sink tokens (cos=1, sin=0 → no rotation)
-        if num_sink > 0:
-            audio_rope_dim = audio_pe[0].shape[-1]
-            sink_cos = torch.ones(1, num_sink, audio_rope_dim, device=device, dtype=audio_pe[0].dtype)
-            sink_sin = torch.zeros(1, num_sink, audio_rope_dim, device=device, dtype=audio_pe[1].dtype)
-            audio_pe = (
-                torch.cat([sink_cos, audio_pe[0]], dim=1),
-                torch.cat([sink_sin, audio_pe[1]], dim=1),
-            )
 
         # === Cross-attention RoPE ===
         # Original uses 1D temporal-only positions at audio_cross_attention_dim (2048).
@@ -619,16 +607,6 @@ class CausalLTXModel(nn.Module):
             is_audio=True,  # Audio temporal conversion
         )
 
-        # Prepend identity RoPE for sink tokens in cross-PE
-        if num_sink > 0:
-            cross_rope_dim = audio_cross_pe[0].shape[-1]
-            sink_cross_cos = torch.ones(1, num_sink, cross_rope_dim, device=device, dtype=audio_cross_pe[0].dtype)
-            sink_cross_sin = torch.zeros(1, num_sink, cross_rope_dim, device=device, dtype=audio_cross_pe[1].dtype)
-            audio_cross_pe = (
-                torch.cat([sink_cross_cos, audio_cross_pe[0]], dim=1),
-                torch.cat([sink_cross_sin, audio_cross_pe[1]], dim=1),
-            )
-
         # === Prepare Transformer Args ===
         video_args = CausalTransformerArgs(
             x=video_x,
@@ -670,11 +648,6 @@ class CausalLTXModel(nn.Module):
             else:
                 video_args, audio_args = block(video_args, audio_args)
 
-        # === Strip sink tokens before output processing ===
-        audio_out_x = audio_args.x
-        if num_sink > 0:
-            audio_out_x = audio_out_x[:, num_sink:]
-
         # === Output Layer (with timestep conditioning) ===
         video_out = self._process_output(
             self.scale_shift_table, self.norm_out, self.proj_out,
@@ -682,7 +655,7 @@ class CausalLTXModel(nn.Module):
         )
         audio_out = self._process_output(
             self.audio_scale_shift_table, self.audio_norm_out, self.audio_proj_out,
-            audio_out_x, audio_embedded_ts,
+            audio_args.x, audio_embedded_ts,
         )
 
         # === Unpatchify Video ===
@@ -731,13 +704,15 @@ class CausalLTXModel(nn.Module):
         else:
             state_dict = torch.load(checkpoint_path, map_location=device)
 
-        # Load with strict=False to ignore mask_builder and optional sink-token keys
+        # Forward-compatible: strip legacy audio_sink_tokens entry if present.
+        for legacy_key in list(state_dict.keys()):
+            if 'audio_sink_tokens' in legacy_key:
+                state_dict.pop(legacy_key)
+
+        # Load with strict=False to ignore mask_builder buffers.
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-        # Verify only expected keys are missing
         expected_missing = ['mask_builder']
-        if config.num_audio_sink_tokens > 0:
-            expected_missing.append('audio_sink_tokens')
         real_missing = [
             key for key in missing
             if not any(pat in key for pat in expected_missing)
@@ -795,3 +770,263 @@ class CausalLTXModel(nn.Module):
     def disable_gradient_checkpointing(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing = False
+
+    # ================================================================
+    # KV-cache Causal Inference / Self-Forcing Training
+    # ================================================================
+
+    def init_av_kv_caches(
+        self,
+        batch_size: int,
+        max_video_frames: int,
+        max_audio_frames: int,
+        text_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> List[Dict[str, Any]]:
+        """Allocate per-layer KV caches for causal AV generation.
+
+        Each layer's cache contains 6 buffers:
+          - video_self: video self-attention K/V (V_cache tokens)
+          - audio_self: audio self-attention K/V (A_cache tokens)
+          - a2v: cross-modal A2V K/V (audio K/V projected by A2V's to_k/to_v)
+          - v2a: cross-modal V2A K/V (video K/V projected by V2A's to_k/to_v)
+          - video_text: video-text crossattn cache (one-shot init)
+          - audio_text: audio-text crossattn cache (one-shot init)
+        """
+        v_cache_tokens = max_video_frames * self.config.video_frame_seqlen
+        a_cache_tokens = max_audio_frames * self.config.audio_frame_seqlen
+
+        v_h, v_d = self.config.video_heads, self.config.video_d_head
+        a_h, a_d = self.config.audio_heads, self.config.audio_d_head
+
+        def _alloc_self(B, T, H, D):
+            return {
+                "k": torch.zeros(B, T, H, D, device=device, dtype=dtype),
+                "v": torch.zeros(B, T, H, D, device=device, dtype=dtype),
+                "end": torch.tensor([0], dtype=torch.long, device=device),
+            }
+
+        def _alloc_text(B, T, H, D):
+            return {
+                "k": torch.zeros(B, T, H * D, device=device, dtype=dtype),
+                "v": torch.zeros(B, T, H * D, device=device, dtype=dtype),
+                "len": 0,
+                "is_init": False,
+            }
+
+        caches: List[Dict[str, Any]] = []
+        for _ in range(self.config.num_layers):
+            caches.append({
+                # video self-attention: video_dim split as v_h * v_d
+                "video_self": _alloc_self(batch_size, v_cache_tokens, v_h, v_d),
+                # audio self-attention: audio_dim split as a_h * a_d
+                "audio_self": _alloc_self(batch_size, a_cache_tokens, a_h, a_d),
+                # A2V: K/V come from the audio_to_video_attn's K/V projection
+                # (output dim = a_h * a_d, since audio_to_video_attn uses audio's heads)
+                "a2v": _alloc_self(batch_size, a_cache_tokens, a_h, a_d),
+                # V2A: K/V come from the video_to_audio_attn's K/V projection
+                # (also audio heads/d_head per causal_block.py construction)
+                "v2a": _alloc_self(batch_size, v_cache_tokens, a_h, a_d),
+                # Text cross-attn caches (full inner dim, one-shot init)
+                "video_text": _alloc_text(batch_size, text_seq_len, v_h, v_d),
+                "audio_text": _alloc_text(batch_size, text_seq_len, a_h, a_d),
+            })
+        return caches
+
+    def forward_with_cache(
+        self,
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        timesteps: torch.Tensor,
+        video_context: torch.Tensor,
+        audio_context: torch.Tensor,
+        kv_caches: List[Dict[str, Any]],
+        current_video_start_frame: int,
+        current_audio_start_frame: int,
+        video_context_mask: Optional[torch.Tensor] = None,
+        audio_context_mask: Optional[torch.Tensor] = None,
+        audio_timesteps: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Causal autoregressive forward for ONE block, with KV caches.
+
+        Inputs cover the CURRENT block only (block-shaped tensors):
+          - video_latent: [B, F_v, C, H, W] for current block (e.g. F_v=4 or 3)
+          - audio_latent: [B, F_a, C]       for current block (e.g. F_a=26 or 25)
+          - timesteps:    [B] or [B, F_v]   sigma values
+          - audio_timesteps: [B] or [B, F_a] (optional, defaults to timesteps)
+          - kv_caches: list[num_layers] of cache dicts (allocated by init_av_kv_caches)
+          - current_video_start_frame: where this video block starts in the global sequence
+          - current_audio_start_frame: where this audio block starts in the global sequence
+
+        Causality is enforced by the cache mechanism: each call writes the
+        block's K/V at offsets [current_*_start_frame * frame_seqlen,
+        current_*_start_frame * frame_seqlen + L_block) and reads the full
+        cache up to the new end. Future tokens are simply not yet written.
+        """
+        B = video_latent.shape[0]
+        device = video_latent.device
+        hidden_dtype = video_latent.dtype
+
+        # === Patch embed (current block only) ===
+        B_v, F_v, C_v, H_v, W_v = video_latent.shape
+        video_flat = video_latent.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+        video_flat = video_flat.reshape(B_v, C_v, -1).permute(0, 2, 1)
+        video_x = self.patchify_proj(video_flat)
+        video_grid_sizes = torch.tensor([F_v, H_v, W_v], device=device).unsqueeze(0)
+
+        audio_x = self.audio_patchify_proj(audio_latent)
+        F_a = audio_x.shape[1]
+        audio_grid_sizes = torch.tensor([F_a], device=device).unsqueeze(0)
+
+        # === Context projection ===
+        video_ctx = self._prepare_context(
+            video_context, self.caption_projection, self.config.video_dim, B
+        )
+        audio_ctx = self._prepare_context(
+            audio_context, self.audio_caption_projection, self.config.audio_dim, B
+        )
+        video_context_mask = self._prepare_attention_mask(video_context_mask, hidden_dtype)
+        audio_context_mask = self._prepare_attention_mask(audio_context_mask, hidden_dtype)
+
+        # === Timestep embedding ===
+        video_ts = timesteps
+        video_timestep_6d, video_embedded_ts = self._prepare_timestep(
+            video_ts, self.adaln_single, B, hidden_dtype
+        )
+        audio_ts = audio_timesteps if audio_timesteps is not None else timesteps
+        audio_timestep_6d, audio_embedded_ts = self._prepare_timestep(
+            audio_ts, self.audio_adaln_single, B, hidden_dtype
+        )
+
+        # === Cross-attention timesteps ===
+        video_cross_ss, video_cross_gate = self._prepare_cross_attention_timestep(
+            video_ts,
+            self.av_ca_video_scale_shift_adaln_single,
+            self.av_ca_a2v_gate_adaln_single,
+            B, hidden_dtype,
+        )
+        audio_cross_ss, audio_cross_gate = self._prepare_cross_attention_timestep(
+            audio_ts,
+            self.av_ca_audio_scale_shift_adaln_single,
+            self.av_ca_v2a_gate_adaln_single,
+            B, hidden_dtype,
+        )
+
+        frame_seqlen = H_v * W_v
+        video_timestep_6d = self._expand_per_frame_to_per_token(video_timestep_6d, frame_seqlen)
+        video_embedded_ts = self._expand_per_frame_to_per_token(video_embedded_ts, frame_seqlen)
+        video_cross_ss = self._expand_per_frame_to_per_token(video_cross_ss, frame_seqlen)
+        video_cross_gate = self._expand_per_frame_to_per_token(video_cross_gate, frame_seqlen)
+
+        # === RoPE for the CURRENT BLOCK at the given start_frame ===
+        video_pe = causal_precompute_freqs_cis(
+            video_grid_sizes, self.config.video_d_head * self.config.video_heads,
+            theta=self.config.pe_theta, max_pos=list(self.config.pe_max_pos),
+            start_frame=current_video_start_frame, rope_type=self.config.rope_type,
+            device=device, dtype=video_x.dtype,
+        )
+        audio_pe = causal_precompute_freqs_cis(
+            audio_grid_sizes, self.config.audio_d_head * self.config.audio_heads,
+            theta=self.config.pe_theta, max_pos=list(self.config.audio_pe_max_pos),
+            start_frame=current_audio_start_frame, rope_type=self.config.rope_type,
+            device=device, dtype=audio_x.dtype,
+            is_audio=True,
+        )
+
+        # === Cross-PE for current block ===
+        cross_pe_max_pos = max(
+            self.config.pe_max_pos[0],
+            self.config.audio_pe_max_pos[0],
+        )
+        # Video temporal cross-PE: [1, F_v, D_cross] for current block
+        video_temporal_grid = torch.tensor([[F_v]], device=device, dtype=torch.long)
+        video_cross_pe = causal_precompute_freqs_cis(
+            video_temporal_grid,
+            self.config.audio_cross_attention_dim,
+            theta=self.config.pe_theta,
+            max_pos=[cross_pe_max_pos],
+            start_frame=current_video_start_frame,
+            rope_type=self.config.rope_type,
+            device=device, dtype=video_x.dtype,
+            is_audio=False,
+        )
+        # Expand temporal -> per-spatial-token
+        video_cross_pe = (
+            video_cross_pe[0].unsqueeze(2).expand(-1, -1, self.config.video_frame_seqlen, -1)
+            .reshape(1, -1, video_cross_pe[0].shape[-1]),
+            video_cross_pe[1].unsqueeze(2).expand(-1, -1, self.config.video_frame_seqlen, -1)
+            .reshape(1, -1, video_cross_pe[1].shape[-1]),
+        )
+
+        audio_temporal_grid = torch.tensor([[F_a]], device=device, dtype=torch.long)
+        audio_cross_pe = causal_precompute_freqs_cis(
+            audio_temporal_grid,
+            self.config.audio_cross_attention_dim,
+            theta=self.config.pe_theta,
+            max_pos=[cross_pe_max_pos],
+            start_frame=current_audio_start_frame,
+            rope_type=self.config.rope_type,
+            device=device, dtype=audio_x.dtype,
+            is_audio=True,
+        )
+
+        # === Build per-layer args with caches ===
+        v_token_start = current_video_start_frame * self.config.video_frame_seqlen
+        a_token_start = current_audio_start_frame * self.config.audio_frame_seqlen
+
+        # === Run transformer blocks with per-layer caches ===
+        for layer_idx, block in enumerate(self.transformer_blocks):
+            layer_caches = kv_caches[layer_idx]
+            video_args = CausalTransformerArgs(
+                x=video_x,
+                timesteps=video_timestep_6d,
+                positional_embeddings=video_pe,
+                context=video_ctx,
+                context_mask=video_context_mask,
+                cross_positional_embeddings=video_cross_pe,
+                cross_scale_shift_timestep=video_cross_ss,
+                cross_gate_timestep=video_cross_gate,
+                kv_cache_self=layer_caches["video_self"],
+                kv_cache_cross=layer_caches["a2v"],          # video's cross-modal Q reads audio K/V via A2V cache
+                crossattn_cache_text=layer_caches["video_text"],
+                current_token_start=v_token_start,
+                cross_token_start=a_token_start,
+            )
+            audio_args = CausalTransformerArgs(
+                x=audio_x,
+                timesteps=audio_timestep_6d,
+                positional_embeddings=audio_pe,
+                context=audio_ctx,
+                context_mask=audio_context_mask,
+                cross_positional_embeddings=audio_cross_pe,
+                cross_scale_shift_timestep=audio_cross_ss,
+                cross_gate_timestep=audio_cross_gate,
+                kv_cache_self=layer_caches["audio_self"],
+                kv_cache_cross=layer_caches["v2a"],          # audio's cross-modal Q reads video K/V via V2A cache
+                crossattn_cache_text=layer_caches["audio_text"],
+                current_token_start=a_token_start,
+                cross_token_start=v_token_start,
+            )
+
+            # KV cache path: skip gradient checkpointing because in-place
+            # cache writes are incompatible with recomputation.
+            video_args, audio_args = block(video_args, audio_args)
+
+            video_x = video_args.x
+            audio_x = audio_args.x
+
+        # === Output layer ===
+        video_out = self._process_output(
+            self.scale_shift_table, self.norm_out, self.proj_out,
+            video_x, video_embedded_ts,
+        )
+        audio_out = self._process_output(
+            self.audio_scale_shift_table, self.audio_norm_out, self.audio_proj_out,
+            audio_x, audio_embedded_ts,
+        )
+
+        # Unpatchify video
+        video_out = video_out.reshape(B, F_v, H_v, W_v, self.config.out_channels)
+        video_out = video_out.permute(0, 1, 4, 2, 3)
+        return video_out, audio_out

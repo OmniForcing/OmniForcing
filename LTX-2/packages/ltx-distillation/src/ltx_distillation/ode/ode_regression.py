@@ -79,10 +79,9 @@ class ODERegressionConfig:
     # No learnable parameters — purely structural rescaling.
     enable_causal_log_rescale: bool = False
 
-    # Number of learnable sink tokens prepended to audio sequence.
-    # Sinks are part of Block 0 (visible to all audio via causal masking),
-    # use identity RoPE (cos=1, sin=0), and are NOT supervised.
-    num_audio_sink_tokens: int = 0
+    # Block 0 video frames (4-3-3-3-... layout). Block 0 has
+    # num_frame_per_block_first video frames + AUDIO_FRAMES_FIRST_BLOCK audio.
+    num_frame_per_block_first: int = 4
 
     # Loss weights for combining video and audio losses.
     # loss = video_loss_weight * video_loss + audio_loss_weight * audio_loss
@@ -157,8 +156,8 @@ class LTX2ODERegression(nn.Module):
         from ltx_causal import CausalLTXModelConfig
         return CausalLTXModelConfig(
             num_frame_per_block=self.config.num_frame_per_block,
+            num_frame_per_block_first=self.config.num_frame_per_block_first,
             enable_causal_log_rescale=self.config.enable_causal_log_rescale,
-            num_audio_sink_tokens=self.config.num_audio_sink_tokens,
         )
 
     def _make_wrapper(self, model):
@@ -167,8 +166,8 @@ class LTX2ODERegression(nn.Module):
         return CausalLTX2DiffusionWrapper(
             model=model,
             num_frame_per_block=self.config.num_frame_per_block,
+            num_frame_per_block_first=self.config.num_frame_per_block_first,
             disable_causal_mask=self.config.disable_causal_mask,
-            num_audio_sink_tokens=self.config.num_audio_sink_tokens,
         )
 
     def _load_models(self):
@@ -237,9 +236,9 @@ class LTX2ODERegression(nn.Module):
             self._generator = CausalLTX2DiffusionWrapper.from_pretrained(
                 self.config.causal_model_checkpoint,
                 num_frame_per_block=self.config.num_frame_per_block,
+                num_frame_per_block_first=self.config.num_frame_per_block_first,
                 disable_causal_mask=self.config.disable_causal_mask,
                 enable_causal_log_rescale=self.config.enable_causal_log_rescale,
-                num_audio_sink_tokens=self.config.num_audio_sink_tokens,
             ).to(self.device)
 
         elif self.config.bidirectional_model_checkpoint:
@@ -540,37 +539,32 @@ class LTX2ODERegression(nn.Module):
             return timestep[:, :1].expand_as(timestep).contiguous()
 
         elif self.config.generator_task == "causal_video":
-            # Make timesteps uniform within each block, respecting Global Prefix.
-            # Attention mask block structure (from mask_builder.py):
-            #   Block 0 (Global Prefix): V_0 alone (1 frame)
-            #   Block 1: V_1 .. V_{block_size}  (block_size frames)
-            #   Block 2: V_{block_size+1} .. V_{2*block_size}  etc.
+            # Make timesteps uniform within each block.
+            # Block layout (4-3-3-3-...):
+            #   Block 0: frames [0, num_frame_per_block_first)
+            #   Block k>=1: frames [first + (k-1)*block_size, first + k*block_size)
             # Timestep grouping must match this exactly.
             B, num_frames = timestep.shape
+            first_block = self.config.num_frame_per_block_first
             block_size = self.num_frame_per_block
 
             if num_frames <= 1:
                 return timestep
 
-            # Block 0 (Global Prefix): frame 0 keeps its own timestep
-            prefix = timestep[:, :1]  # [B, 1]
+            result = timestep.clone()
 
-            # Remaining frames: group by block_size
-            rest = timestep[:, 1:]  # [B, num_frames - 1]
-            rest_len = rest.shape[1]
+            # Block 0: all frames share first frame's timestep
+            end0 = min(first_block, num_frames)
+            result[:, :end0] = timestep[:, :1].expand(B, end0)
 
-            if rest_len > 0:
-                # Pad to multiple of block_size
-                pad_size = (block_size - rest_len % block_size) % block_size
-                if pad_size > 0:
-                    pad_value = rest[:, -1:].expand(-1, pad_size)
-                    rest = torch.cat([rest, pad_value], dim=1)
+            # Remaining blocks: group by block_size
+            idx = end0
+            while idx < num_frames:
+                end = min(idx + block_size, num_frames)
+                result[:, idx:end] = timestep[:, idx:idx + 1].expand(B, end - idx)
+                idx = end
 
-                rest = rest.reshape(B, -1, block_size)
-                rest[:, :, 1:] = rest[:, :, 0:1]
-                rest = rest.reshape(B, -1)[:, :rest_len]
-
-            return torch.cat([prefix, rest], dim=1)
+            return result
 
         else:
             raise NotImplementedError(f"Unknown task: {self.config.generator_task}")

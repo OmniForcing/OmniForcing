@@ -60,8 +60,8 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         video_width: int = 768,
         vae_spatial_compression: int = 32,
         num_frame_per_block: int = 3,
+        num_frame_per_block_first: int = 4,
         disable_causal_mask: bool = False,
-        num_audio_sink_tokens: int = 0,
     ):
         """
         Args:
@@ -69,10 +69,10 @@ class CausalLTX2DiffusionWrapper(nn.Module):
             video_height: Video height in pixels
             video_width: Video width in pixels
             vae_spatial_compression: VAE spatial compression factor
-            num_frame_per_block: Frames per causal generation block
+            num_frame_per_block: Frames per causal generation block (>=1)
+            num_frame_per_block_first: Frames in Block 0 (4-3-3-3-... layout)
             disable_causal_mask: If True, disable all causal masks (fully bidirectional,
                 equivalent to original LTX-2). Used for ablation studies.
-            num_audio_sink_tokens: Number of learnable sink tokens prepended to audio
         """
         super().__init__()
         self.model = model
@@ -80,8 +80,8 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         self.video_width = video_width
         self.vae_spatial_compression = vae_spatial_compression
         self.num_frame_per_block = num_frame_per_block
+        self.num_frame_per_block_first = num_frame_per_block_first
         self.disable_causal_mask = disable_causal_mask
-        self.num_audio_sink_tokens = num_audio_sink_tokens
 
         # Validate patch_size compatibility
         if hasattr(model, 'config') and hasattr(model.config, 'patch_size'):
@@ -107,7 +107,7 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         self.mask_config = CausalMaskConfig(
             video_frame_seqlen=self.video_frame_seqlen,
             num_frame_per_block=num_frame_per_block,
-            num_audio_sink_tokens=num_audio_sink_tokens,
+            num_frame_per_block_first=num_frame_per_block_first,
         )
 
         # Cache masks per (shape, device, sink-token config) so training and
@@ -214,46 +214,30 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         timestep: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Process timestep for causal generation with Global Prefix.
+        Process timestep for causal generation (4-3-3-3-... layout).
 
-        Makes timesteps uniform within each generation block.
-        Block 0 (Global Prefix): frame 0 only.
-        Blocks 1..N: groups of num_frame_per_block starting from frame 1.
-
-        Args:
-            timestep: [B, F] per-frame timesteps
-
-        Returns:
-            [B, F] timesteps with uniform values within blocks
-
-        Example (num_frame_per_block=3, 16 frames):
-            Block 0: frame 0 (V_0 Global Prefix)
-            Block 1: frames 1-3
-            Block 2: frames 4-6
-            ...
-            Input:  [t0, t1, t2, t3, t4, t5, t6, ...]
-            Output: [t0, t1, t1, t1, t4, t4, t4, ...]
+        Makes timesteps uniform within each generation block:
+            Block 0: frames [0, num_frame_per_block_first)
+            Block k>=1: frames [num_frame_per_block_first + (k-1)*num_frame_per_block,
+                                num_frame_per_block_first + k*num_frame_per_block)
         """
         if timestep.ndim == 1:
-            # Single timestep for all frames - no processing needed
             return timestep
 
         B, F = timestep.shape
-
         if F <= 1:
             return timestep
 
         result = timestep.new_zeros(B, F)
 
-        # Block 0 (Global Prefix): frame 0 keeps its own timestep
-        result[:, 0] = timestep[:, 0]
+        first = self.num_frame_per_block_first
+        end0 = min(first, F)
+        result[:, :end0] = timestep[:, :1].expand(B, end0)
 
-        # Standard blocks: groups of num_frame_per_block starting from frame 1
         block_size = self.num_frame_per_block
-        idx = 1
+        idx = end0
         while idx < F:
             end = min(idx + block_size, F)
-            # Use first timestep of this block for all frames in the block
             result[:, idx:end] = timestep[:, idx:idx + 1].expand(B, end - idx)
             idx = end
 
@@ -274,14 +258,12 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         if self.disable_causal_mask:
             return {'video_self': None, 'audio_self': None, 'a2v': None, 'v2a': None}
 
-        # num_audio_sink_tokens is encoded in self.mask_config, but we still
-        # keep it in the cache key so the reuse contract is explicit.
         cache_key = (
             num_video_frames,
             num_audio_frames,
             str(device),
             self.mask_config.num_frame_per_block,
-            self.mask_config.num_audio_sink_tokens,
+            self.mask_config.num_frame_per_block_first,
             self.mask_config.video_frame_seqlen,
         )
 
@@ -327,6 +309,12 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         audio_timestep: Optional[torch.Tensor] = None,
         use_causal_timestep: bool = True,
         force_bidirectional: bool = False,
+        # KV-cache autoregressive path (Self-Forcing). When kv_caches is
+        # provided the wrapper dispatches to the per-block KV-cache forward
+        # so that FSDP parameter gather works correctly via __call__.
+        kv_caches=None,
+        current_video_start_frame: int = 0,
+        current_audio_start_frame: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for training.
@@ -350,6 +338,19 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         Returns:
             (video_x0, audio_x0): Denoised x0 predictions.
         """
+        # === KV-cache autoregressive path (Self-Forcing) ===
+        if kv_caches is not None:
+            return self._forward_with_cache_impl(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                noisy_audio=noisy_audio,
+                audio_timestep=audio_timestep,
+                kv_caches=kv_caches,
+                current_video_start_frame=current_video_start_frame,
+                current_audio_start_frame=current_audio_start_frame,
+            )
+
         B, F_v, C, H, W = noisy_image_or_video.shape
         device = noisy_image_or_video.device
 
@@ -368,9 +369,12 @@ class CausalLTX2DiffusionWrapper(nn.Module):
                 audio_timestep=audio_timestep,
             )
 
-        # Compute aligned audio frame count for Global Prefix block structure
-        # With V_0 + A_0 in Block 0, aligned count matches ltx-core exactly (no truncation)
-        aligned_audio = compute_aligned_audio_frames(F_v, self.num_frame_per_block)
+        # Compute aligned audio frame count for the 4-3-3-3-... block layout.
+        aligned_audio = compute_aligned_audio_frames(
+            F_v,
+            num_frame_per_block=self.num_frame_per_block,
+            num_frame_per_block_first=self.num_frame_per_block_first,
+        )
 
         # Compute audio frames if not provided
         if noisy_audio is None:
@@ -449,6 +453,97 @@ class CausalLTX2DiffusionWrapper(nn.Module):
 
         return video_x0, audio_x0
 
+    # ------------------------------------------------------------------
+    # KV-cache causal forward (Self-Forcing autoregressive path)
+    # ------------------------------------------------------------------
+
+    def init_av_kv_caches(
+        self,
+        batch_size: int,
+        max_video_frames: int,
+        max_audio_frames: int,
+        text_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        """Allocate per-layer AV KV caches."""
+        return self.model.init_av_kv_caches(
+            batch_size=batch_size,
+            max_video_frames=max_video_frames,
+            max_audio_frames=max_audio_frames,
+            text_seq_len=text_seq_len,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _forward_with_cache_impl(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: Dict[str, torch.Tensor],
+        timestep: torch.Tensor,
+        kv_caches,
+        current_video_start_frame: int,
+        current_audio_start_frame: int,
+        noisy_audio: Optional[torch.Tensor] = None,
+        audio_timestep: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-block KV-cache forward; returns x0 predictions.
+
+        timestep is expected to be block-uniform (same sigma across all
+        frames of the block). Velocity-to-x0 conversion mirrors `forward`.
+        Callers under FSDP MUST go through `__call__` (i.e. dispatch via
+        `forward(... kv_caches=...)`) so that pre/post-forward hooks run.
+        """
+        video_context = conditional_dict.get('video_context')
+        audio_context = conditional_dict.get('audio_context')
+        video_context_mask = conditional_dict.get('video_context_mask')
+        audio_context_mask = conditional_dict.get('audio_context_mask')
+        if video_context is None and 'context' in conditional_dict:
+            video_context = conditional_dict['context']
+        if audio_context is None:
+            audio_context = video_context
+        shared_mask = conditional_dict.get('attention_mask')
+        if video_context_mask is None and shared_mask is not None:
+            video_context_mask = shared_mask
+        if audio_context_mask is None and shared_mask is not None:
+            audio_context_mask = shared_mask
+
+        # Call through self.model(...) (not .forward_with_cache) so that if
+        # self.model is FSDP-wrapped, the FSDP pre/post-forward hooks fire
+        # and unshard parameters. CausalLTXModel.forward() dispatches to
+        # forward_with_cache internally when kv_caches is not None.
+        video_velocity, audio_velocity = self.model(
+            video_latent=noisy_image_or_video,
+            audio_latent=noisy_audio,
+            timesteps=timestep,
+            audio_timesteps=audio_timestep,
+            video_context=video_context,
+            audio_context=audio_context,
+            video_context_mask=video_context_mask,
+            audio_context_mask=audio_context_mask,
+            kv_caches=kv_caches,
+            current_video_start_frame=current_video_start_frame,
+            current_audio_start_frame=current_audio_start_frame,
+        )
+
+        compute_dtype = torch.float32
+        video_sigma = self._reshape_sigma_for_broadcast(timestep, noisy_image_or_video)
+        video_x0 = (
+            noisy_image_or_video.to(compute_dtype)
+            - video_velocity.to(compute_dtype) * video_sigma.to(compute_dtype)
+        ).to(noisy_image_or_video.dtype)
+
+        if noisy_audio is None:
+            return video_x0, None
+
+        audio_sigma_raw = audio_timestep if audio_timestep is not None else timestep
+        audio_sigma = self._reshape_sigma_for_broadcast(audio_sigma_raw, noisy_audio)
+        audio_x0 = (
+            noisy_audio.to(compute_dtype)
+            - audio_velocity.to(compute_dtype) * audio_sigma.to(compute_dtype)
+        ).to(noisy_audio.dtype)
+        return video_x0, audio_x0
+
     @classmethod
     def from_pretrained(
         cls,
@@ -456,49 +551,28 @@ class CausalLTX2DiffusionWrapper(nn.Module):
         video_height: int = 512,
         video_width: int = 768,
         num_frame_per_block: int = 3,
+        num_frame_per_block_first: int = 4,
         disable_causal_mask: bool = False,
         enable_causal_log_rescale: bool = False,
-        num_audio_sink_tokens: int = 0,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ) -> "CausalLTX2DiffusionWrapper":
-        """
-        Load wrapper from pretrained checkpoint.
-
-        Args:
-            checkpoint_path: Path to LTX-2 checkpoint
-            video_height: Video height in pixels
-            video_width: Video width in pixels
-            num_frame_per_block: Frames per generation block
-            disable_causal_mask: If True, disable all causal masks
-            enable_causal_log_rescale: If True, apply log-ratio entropy rescaling
-            num_audio_sink_tokens: Number of learnable sink tokens prepended to audio
-            device: Target device
-            dtype: Model dtype
-
-        Returns:
-            Initialized CausalLTX2DiffusionWrapper
-        """
-        # Create model config
+        """Load wrapper from pretrained checkpoint."""
         config = CausalLTXModelConfig(
             num_frame_per_block=num_frame_per_block,
+            num_frame_per_block_first=num_frame_per_block_first,
             enable_causal_log_rescale=enable_causal_log_rescale,
-            num_audio_sink_tokens=num_audio_sink_tokens,
         )
-
-        # Load model
         model = CausalLTXModel.from_pretrained(
             checkpoint_path, config, device, dtype
         )
-
-        # Create wrapper
         return cls(
             model=model,
             video_height=video_height,
             video_width=video_width,
             num_frame_per_block=num_frame_per_block,
+            num_frame_per_block_first=num_frame_per_block_first,
             disable_causal_mask=disable_causal_mask,
-            num_audio_sink_tokens=num_audio_sink_tokens,
         )
 
 

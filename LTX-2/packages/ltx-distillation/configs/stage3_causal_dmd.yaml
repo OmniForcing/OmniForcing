@@ -20,11 +20,11 @@ gemma_path: /path/to/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized
 # Checkpoint Loading (Priority: resume_checkpoint > stage1_ckpt_path > generator_ckpt)
 # =============================================================================
 resume_checkpoint: null
-# Stage 2 ODE-initialized causal model
-stage1_ckpt_path: /path/to/outputs/stage2_causal_ode/checkpoint_XXXXX/model.pt
-# Stage 1 bidirectional DMD model (used as generator bootstrap and critic init)
-generator_ckpt: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
-bootstrap_bidirectional_ckpt_path: /path/to/outputs/stage1_bidirectional_dmd/checkpoint_XXXXX/model.pt
+# Stage 2 ODE-initialized causal model (used as generator init)
+stage1_ckpt_path: ./saved_checkpoints/stage2_ode_4step_512_step5000.pt
+# No Stage 1 bidirectional DMD — real/fake scores init from original LTX-2 checkpoint
+generator_ckpt: null
+bootstrap_bidirectional_ckpt_path: null
 stage1_ckpt_strict: false
 
 # =============================================================================
@@ -58,15 +58,36 @@ denoising_loss_type: velocity
 # =============================================================================
 # DMD Hyperparameters
 # =============================================================================
+# 4-step denoising (5 sigma points including clean endpoint).
+# Matches the schedule used to generate ODE pairs in `ode_lmdb`, so Stage 2
+# ODE-init is already aligned with these sigmas.
 denoising_step_list:
   - 1000
-  - 757
-  - 522
+  - 909
+  - 725
+  - 421
   - 0
 
+# 8-step denoising (commented out — 5/8 exit steps clustered at σ>0.975
+# causes severe under-training of mid-sigma refinement).
+# denoising_step_list:
+#   - 1000
+#   - 993
+#   - 987
+#   - 981
+#   - 975
+#   - 909
+#   - 725
+#   - 421
+#   - 0
+
+# NOTE: LTX2Scheduler has a built-in sigmoid shift (sigma_shift=2.05).
+# No external timestep_shift or warp_denoising_step is needed.
 num_train_timestep: 1000
-real_video_guidance_scale: 5.0
-real_audio_guidance_scale: 9.0
+# Real score (teacher) CFG for DMD KL gradient. Aligned with LTX-2 official
+# inference defaults (video=3.0, audio=5.0). No STG/modality needed here.
+real_video_guidance_scale: 3.0
+real_audio_guidance_scale: 5.0
 dmd_latent_mode: direct_noise
 backward_simulation: false
 dfake_gen_update_ratio: 5
@@ -74,8 +95,9 @@ dfake_gen_update_ratio: 5
 # =============================================================================
 # Causal Architecture Settings (preserve from Stage 2)
 # =============================================================================
+# 4-3-3-3-... block layout (no Global Prefix special case, no sink tokens).
 num_frame_per_block: 3
-num_audio_sink_tokens: 16
+num_frame_per_block_first: 4
 enable_causal_log_rescale: false
 disable_causal_mask: false
 skip_cross_modal_attention: false
@@ -84,10 +106,10 @@ loss_target: velocity
 # =============================================================================
 # Self-Forcing Configuration
 # =============================================================================
-self_forcing_runtime: prefix_rerun       # prefix_rerun or kv_cache
-self_forcing_min_generated_blocks: 5
-self_forcing_max_generated_blocks: 5
-self_forcing_loss_scope: last_block      # Loss computed on last generated block
+# All blocks carry gradient every iteration (Self-Forcing style).
+# Single output tensor + single .backward() — fully FSDP-compatible.
+context_noise: 0
+same_step_across_blocks: true
 
 # =============================================================================
 # Loss Weights and Block-Aware Weighting
@@ -112,24 +134,34 @@ lr: 2.0e-05
 generator_lr: 2.0e-05
 critic_lr: 2.0e-05
 
-beta1: 0.9
+beta1: 0.0
 beta2: 0.999
+# Separate critic betas (Self-Forcing uses independent beta1_critic/beta2_critic)
+beta1_critic: 0.0
+beta2_critic: 0.999
 weight_decay: 0.01
-max_grad_norm: 10.0
+# Tighter grad clipping for training safety. With LR 2e-5 (10× SF's 2e-6),
+# occasional grad spikes can destabilize training; 1.0 bounds each step's
+# update magnitude much more conservatively than SF's default 10.0.
+max_grad_norm: 1.0
 
-scheduler_type: cosine_warmup
-warmup_steps: 1000
-max_steps: 20000
-min_lr: 1.0e-07
+scheduler_type: constant
+warmup_steps: 0
+max_steps: 1000000
+min_lr: 2.0e-05
 
 gradient_accumulation_steps: 1
+
+# EMA weights for generator (stabilises DMD training).
+ema_weight: 0.99
+ema_start_step: 200
 
 # =============================================================================
 # Data Configuration
 # =============================================================================
 # Path to ODE LMDB dataset (same as Stage 2)
-data_path: /path/to/data/ode_lmdb
-benchmark_prompt_file: /path/to/data/prompts.txt
+data_path: ./ode_lmdb_4step_512
+benchmark_prompt_file: ./prompts/benchmark_8.txt
 
 negative_prompt: "blurry, out of focus, overexposed, underexposed, low contrast, excessive noise, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, artifacts around text, inconsistent perspective, cartoonish rendering, uncanny valley effect, mismatched lip sync, silent or muted audio, distorted voice, off-sync audio, repetitive speech, jittery movement, unnatural transitions, flat lighting, stylized filters, or AI artifacts."
 
@@ -155,12 +187,12 @@ text_encoder_fsdp_wrap_strategy: size
 # Logging and Checkpointing
 # =============================================================================
 output_path: ./outputs/stage3_self_forcing_dmd
-log_iters: 200
+log_iters: 100
 
 wandb_project: OmniForcing
-wandb_entity: your-wandb-entity
+wandb_entity: 547634227-peking-university
 wandb_name: stage3_self_forcing_dmd
-# wandb_api_key: "your-wandb-api-key"
+wandb_api_key: "your-wandb-api-key"
 
 seed: 42
 no_save: false
@@ -169,7 +201,7 @@ no_save: false
 # Benchmark Configuration
 # =============================================================================
 benchmark_enabled: true
-benchmark_iters: 200
+benchmark_iters: 100
 benchmark_num_prompts: 8
 benchmark_seed: 12345
 benchmark_video_fps: 24

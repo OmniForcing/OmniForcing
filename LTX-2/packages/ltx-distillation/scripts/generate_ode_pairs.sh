@@ -46,7 +46,9 @@ VIDEO_WIDTH="${VIDEO_WIDTH:-768}"
 
 # Generation parameters
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-40}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
+VIDEO_GUIDANCE_SCALE="${VIDEO_GUIDANCE_SCALE:-3.0}"
+AUDIO_GUIDANCE_SCALE="${AUDIO_GUIDANCE_SCALE:-7.0}"
+RESCALE_SCALE="${RESCALE_SCALE:-0.7}"
 
 # CPU threading (128 CPUs per node, single GPU)
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-128}"
@@ -65,7 +67,9 @@ echo "Output:        ${OUTPUT_DIR}"
 echo "Frames:        ${NUM_FRAMES}"
 echo "Resolution:    ${VIDEO_HEIGHT}x${VIDEO_WIDTH}"
 echo "Steps:         ${NUM_INFERENCE_STEPS}"
-echo "Guidance:      ${GUIDANCE_SCALE}"
+echo "Video CFG:     ${VIDEO_GUIDANCE_SCALE}"
+echo "Audio CFG:     ${AUDIO_GUIDANCE_SCALE}"
+echo "Rescale:       ${RESCALE_SCALE}"
 echo "=============================================="
 
 python -m ltx_distillation.ode.generate_ode_pairs \
@@ -77,7 +81,9 @@ python -m ltx_distillation.ode.generate_ode_pairs \
     --video_height ${VIDEO_HEIGHT} \
     --video_width ${VIDEO_WIDTH} \
     --num_inference_steps ${NUM_INFERENCE_STEPS} \
-    --guidance_scale ${GUIDANCE_SCALE} \
+    --video_guidance_scale ${VIDEO_GUIDANCE_SCALE} \
+    --audio_guidance_scale ${AUDIO_GUIDANCE_SCALE} \
+    --rescale_scale ${RESCALE_SCALE} \
     "$@"
 
 echo "=============================================="

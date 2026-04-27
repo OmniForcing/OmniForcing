@@ -15,7 +15,7 @@ Weight-compatible with original BasicAVTransformerBlock.
 """
 
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -68,6 +68,16 @@ class CausalTransformerArgs:
     # Log-ratio scales for causal attention output (entropy-aligned rescaling)
     self_attn_log_scale: Optional[torch.Tensor] = None   # [1, L, 1]
     cross_attn_log_scale: Optional[torch.Tensor] = None  # [1, L, 1]
+
+    # KV-cache fields for causal autoregressive inference / self-forcing
+    # training. When provided, the block uses incremental KV-cache attention
+    # instead of block_mask / cross_causal_mask. All fields are per-layer
+    # (the caller passes per-layer dicts via the block-level forward kwargs).
+    kv_cache_self: Optional[Dict[str, Any]] = None         # own-modality self-attn cache
+    kv_cache_cross: Optional[Dict[str, Any]] = None        # cross-modal attn cache (this branch's Q -> other's K/V)
+    crossattn_cache_text: Optional[Dict[str, Any]] = None  # text cross-attn cache (one-shot)
+    current_token_start: int = 0                            # own-modality token offset (for cache writes & RoPE)
+    cross_token_start: int = 0                              # other-modality token offset (for cross-modal cache writes & RoPE)
 
 
 # FeedForward imported from compat.py (uses GELUApprox for weight-compatible state_dict keys)
@@ -311,12 +321,14 @@ class CausalAVTransformerBlock(nn.Module):
 
             norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
 
-            # Causal self-attention with block_mask
+            # Causal self-attention with block_mask OR KV cache.
             vx_attn = self.attn1(
                 norm_vx,
                 pe=video.positional_embeddings,
-                block_mask=video.block_mask,
+                block_mask=video.block_mask if video.kv_cache_self is None else None,
                 logit_log_scale=video.self_attn_log_scale,
+                kv_cache=video.kv_cache_self,
+                kv_start=video.current_token_start,
             )
 
             # Collect gate stats for diagnostics (detach to avoid affecting
@@ -336,11 +348,13 @@ class CausalAVTransformerBlock(nn.Module):
 
             vx = vx + vx_attn * vgate_msa
 
-            # Video-text cross-attention (non-causal)
+            # Video-text cross-attention (non-causal). Reuses crossattn cache
+            # across denoising steps and rollout blocks when provided.
             vx_text_attn = self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 mask=video.context_mask,
+                crossattn_cache=video.crossattn_cache_text,
             )
             if self._store_gate_stats:
                 with torch.no_grad():
@@ -360,12 +374,14 @@ class CausalAVTransformerBlock(nn.Module):
 
             norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
 
-            # Causal self-attention
+            # Causal self-attention with block_mask OR KV cache.
             ax_attn = self.audio_attn1(
                 norm_ax,
                 pe=audio.positional_embeddings,
-                block_mask=audio.block_mask,
+                block_mask=audio.block_mask if audio.kv_cache_self is None else None,
                 logit_log_scale=audio.self_attn_log_scale,
+                kv_cache=audio.kv_cache_self,
+                kv_start=audio.current_token_start,
             )
 
             # Collect audio gate stats
@@ -381,11 +397,12 @@ class CausalAVTransformerBlock(nn.Module):
 
             ax = ax + ax_attn * agate_msa
 
-            # Audio-text cross-attention (non-causal)
+            # Audio-text cross-attention (non-causal). Reuses crossattn cache.
             ax_text_attn = self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
                 mask=audio.context_mask,
+                crossattn_cache=audio.crossattn_cache_text,
             )
             if self._store_gate_stats:
                 with torch.no_grad():
@@ -429,7 +446,7 @@ class CausalAVTransformerBlock(nn.Module):
                 video.cross_gate_timestep,
             )
 
-            # A2V: Video attends to Audio (with timestamp causal mask)
+            # A2V: Video attends to Audio (with timestamp causal mask OR KV cache)
             if run_a2v:
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v) + shift_ca_video_hidden_states_a2v
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
@@ -439,8 +456,10 @@ class CausalAVTransformerBlock(nn.Module):
                     context=ax_scaled,
                     pe=video.cross_positional_embeddings,
                     k_pe=audio.cross_positional_embeddings,
-                    cross_causal_mask=video.cross_causal_mask,  # A2V timestamp mask
+                    cross_causal_mask=video.cross_causal_mask if video.kv_cache_cross is None else None,
                     logit_log_scale=video.cross_attn_log_scale,
+                    kv_cache=video.kv_cache_cross,
+                    kv_start=video.cross_token_start,  # audio token offset
                 )
 
                 if self._store_gate_stats:
@@ -454,7 +473,7 @@ class CausalAVTransformerBlock(nn.Module):
 
                 vx = vx + a2v_out * gate_out_a2v
 
-            # V2A: Audio attends to Video (with timestamp causal mask)
+            # V2A: Audio attends to Video (with timestamp causal mask OR KV cache)
             if run_v2a:
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
@@ -464,8 +483,10 @@ class CausalAVTransformerBlock(nn.Module):
                     context=vx_scaled,
                     pe=audio.cross_positional_embeddings,
                     k_pe=video.cross_positional_embeddings,
-                    cross_causal_mask=audio.cross_causal_mask,  # V2A timestamp mask
+                    cross_causal_mask=audio.cross_causal_mask if audio.kv_cache_cross is None else None,
                     logit_log_scale=audio.cross_attn_log_scale,
+                    kv_cache=audio.kv_cache_cross,
+                    kv_start=audio.cross_token_start,  # video token offset
                 )
 
                 if self._store_gate_stats:

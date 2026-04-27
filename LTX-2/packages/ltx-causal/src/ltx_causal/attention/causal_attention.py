@@ -11,7 +11,7 @@ Key Design Decisions:
 3. BlockMask for causal self-attention, dense mask for cross-attention
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,10 @@ class CausalLTXAttention(nn.Module):
         block_mask: Optional["BlockMask"] = None,
         cross_causal_mask: Optional[torch.Tensor] = None,
         logit_log_scale: Optional[torch.Tensor] = None,
+        # === KV-cache Causal Inference / Self-Forcing Training Parameters ===
+        kv_cache: Optional[Dict[str, Any]] = None,
+        crossattn_cache: Optional[Dict[str, Any]] = None,
+        kv_start: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass for training with causal masks.
@@ -124,7 +128,92 @@ class CausalLTXAttention(nn.Module):
         B, L, _ = x.shape
         context = x if context is None else context
 
-        # Projections
+        # ============================================================
+        # Text cross-attention with one-shot crossattn_cache.
+        # Text context is fixed across denoising steps and blocks; we
+        # project K/V once, mark `is_init=True`, and reuse forever.
+        # ============================================================
+        if crossattn_cache is not None:
+            q = self.q_norm(self.to_q(x))
+            if not crossattn_cache.get("is_init", False):
+                k_text = self.k_norm(self.to_k(context))
+                v_text = self.to_v(context)
+                ctx_len = k_text.shape[1]
+                crossattn_cache["k"][:, :ctx_len] = k_text.detach()
+                crossattn_cache["v"][:, :ctx_len] = v_text.detach()
+                crossattn_cache["len"] = ctx_len
+                crossattn_cache["is_init"] = True
+            ctx_len = crossattn_cache["len"]
+            # clone() to break view→cache link for autograd safety
+            k_full = crossattn_cache["k"][:, :ctx_len].clone()
+            v_full = crossattn_cache["v"][:, :ctx_len].clone()
+
+            if logit_log_scale is not None:
+                q = q * logit_log_scale
+
+            q = q.view(B, -1, self.heads, self.dim_head)
+            k_full = k_full.view(B, ctx_len, self.heads, self.dim_head)
+            v_full = v_full.view(B, ctx_len, self.heads, self.dim_head)
+
+            attn_mask = mask if mask is not None else None
+            out = standard_attention_forward(q, k_full, v_full, attn_mask)
+            out = out.reshape(B, -1, self.inner_dim)
+            return self.to_out(out)
+
+        # ============================================================
+        # KV-cache causal path (self-attn or cross-modal attn).
+        # On every call, we project the CURRENT block's Q/K/V, write
+        # the new K/V into the ring at offset `kv_start`, and then
+        # attend over `kv_cache[: end]` (no mask needed: causality is
+        # enforced by the fact that future tokens are not yet written).
+        # ============================================================
+        if kv_cache is not None:
+            q = self.q_norm(self.to_q(x))
+            k = self.k_norm(self.to_k(context))
+            v = self.to_v(context)
+
+            if pe is not None:
+                q = self._apply_rope(q, pe)
+                k = self._apply_rope(k, pe if k_pe is None else k_pe)
+
+            if logit_log_scale is not None:
+                q = q * logit_log_scale
+
+            L_kv = k.shape[1]
+            ctx_start = kv_start
+            ctx_end = ctx_start + L_kv
+
+            q = q.view(B, -1, self.heads, self.dim_head)
+            k = k.view(B, L_kv, self.heads, self.dim_head)
+            v = v.view(B, L_kv, self.heads, self.dim_head)
+
+            # Write new K/V into cache at [ctx_start, ctx_end). Use detached
+            # copies for the in-place write so that subsequent overwrites (e.g.
+            # context_noise refresh) don't break autograd's version tracking.
+            kv_cache["k"][:, ctx_start:ctx_end] = k.detach()
+            kv_cache["v"][:, ctx_start:ctx_end] = v.detach()
+            cur_end = int(kv_cache["end"].item())
+            new_end = max(cur_end, ctx_end)
+            kv_cache["end"].fill_(new_end)
+
+            # Read historical K/V (detached, from previous no_grad blocks)
+            # and concatenate with current K/V (with grad for backward).
+            # clone() breaks the view→cache link so in-place cache writes
+            # in later layers / steps don't corrupt the backward graph
+            # (Flash Attention does this implicitly via .contiguous()).
+            k_hist = kv_cache["k"][:, :ctx_start].clone()
+            v_hist = kv_cache["v"][:, :ctx_start].clone()
+            k_full = torch.cat([k_hist, k], dim=1) if ctx_start > 0 else k
+            v_full = torch.cat([v_hist, v], dim=1) if ctx_start > 0 else v
+
+            out = standard_attention_forward(q, k_full, v_full)
+            out = out.reshape(B, -1, self.inner_dim)
+            return self.to_out(out)
+
+        # ============================================================
+        # Original full-sequence training paths (bidirectional, or
+        # causal training with explicit block_mask / cross_causal_mask).
+        # ============================================================
         q = self.to_q(x)
         k = self.to_k(context)
         v = self.to_v(context)
@@ -151,27 +240,12 @@ class CausalLTXAttention(nn.Module):
         k = k.view(B, -1, self.heads, self.dim_head)
         v = v.view(B, -1, self.heads, self.dim_head)
 
-        # Apply attention
-        if block_mask is not None:
-            if not FLEX_ATTENTION_AVAILABLE:
-                raise RuntimeError(
-                    "block_mask provided but flex_attention is not available. "
-                    "PyTorch 2.2+ with CUDA is required for causal self-attention."
-                )
-            # === Flexattention Path (Self-Attention with BlockMask) ===
-            out = flex_attention_forward(q, k, v, block_mask)
-
-        elif cross_causal_mask is not None:
-            # === Standard Attention with Dense Causal Mask (Cross-Attention) ===
-            out = standard_attention_forward(q, k, v, cross_causal_mask)
-
-        elif mask is not None:
-            # === Standard Attention with Provided Mask (no temperature) ===
-            out = standard_attention_forward(q, k, v, mask)
-
-        else:
-            # === Standard Attention (No Mask, no temperature) ===
-            out = standard_attention_forward(q, k, v)
+        # Apply attention — all paths use SDPA (standard_attention_forward).
+        # block_mask and cross_causal_mask are both dense bool tensors.
+        attn_mask = block_mask if block_mask is not None else cross_causal_mask
+        if attn_mask is None:
+            attn_mask = mask
+        out = standard_attention_forward(q, k, v, attn_mask)
 
         # Reshape and project output
         out = out.reshape(B, -1, self.inner_dim)

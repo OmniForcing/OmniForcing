@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from ltx_core.loader.registry import StateDictRegistry
 
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -124,28 +125,9 @@ class LTX2DMD(nn.Module):
             )
         if self.enable_self_forcing and not self.generator_use_causal_wrapper:
             raise ValueError("Stage3 Self-Forcing requires generator_use_causal_wrapper=true")
-        self.self_forcing_runtime = str(
-            getattr(args, "self_forcing_runtime", "prefix_rerun")
-        ).lower()
-        if self.self_forcing_runtime not in {"prefix_rerun", "kv_cache"}:
-            raise ValueError(
-                f"Invalid self_forcing_runtime={self.self_forcing_runtime}, "
-                "expected prefix_rerun|kv_cache"
-            )
-        self.self_forcing_min_generated_blocks = getattr(
-            args, "self_forcing_min_generated_blocks", None
-        )
-        self.self_forcing_max_generated_blocks = getattr(
-            args, "self_forcing_max_generated_blocks", None
-        )
-        self.self_forcing_loss_scope = str(
-            getattr(args, "self_forcing_loss_scope", "last_block")
-        ).lower()
-        if self.self_forcing_loss_scope != "last_block":
-            raise ValueError(
-                f"Invalid self_forcing_loss_scope={self.self_forcing_loss_scope}, "
-                "only last_block is currently supported"
-            )
+        # Self-Forcing rollout knobs (mirror Self-Forcing pipeline/self_forcing_training.py)
+        self.context_noise = int(getattr(args, "context_noise", 0))
+        self.same_step_across_blocks = bool(getattr(args, "same_step_across_blocks", True))
 
         # Initialize models (will be populated by _init_models or external loading)
         self.generator: LTX2DiffusionWrapper = None
@@ -438,8 +420,8 @@ class LTX2DMD(nn.Module):
                 _init_log("build causal wrapper start")
                 causal_config = CausalLTXModelConfig(
                     num_frame_per_block=self.num_frame_per_block,
+                    num_frame_per_block_first=getattr(args, "num_frame_per_block_first", 4),
                     enable_causal_log_rescale=getattr(args, "enable_causal_log_rescale", False),
-                    num_audio_sink_tokens=getattr(args, "num_audio_sink_tokens", 0),
                 )
                 model = CausalLTXModel(causal_config).to(device=target_device, dtype=self.dtype)
                 wrapper = CausalLTX2DiffusionWrapper(
@@ -447,17 +429,20 @@ class LTX2DMD(nn.Module):
                     video_height=video_height,
                     video_width=video_width,
                     num_frame_per_block=self.num_frame_per_block,
+                    num_frame_per_block_first=getattr(args, "num_frame_per_block_first", 4),
                     disable_causal_mask=getattr(args, "disable_causal_mask", False),
-                    num_audio_sink_tokens=getattr(args, "num_audio_sink_tokens", 0),
                 )
                 state_dict = _remap_state_dict_keys(
                     _load_checkpoint_state_dict(args.checkpoint_path)
                 )
+                # Strip legacy sink-token entries from old checkpoints.
+                for legacy in [k for k in list(state_dict.keys()) if "audio_sink_tokens" in k]:
+                    state_dict.pop(legacy)
                 _init_log("load causal wrapper base state done")
                 missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
                 real_missing = [
                     k for k in missing
-                    if "mask_builder" not in k and "audio_sink_tokens" not in k and "causal_gate" not in k
+                    if "mask_builder" not in k and "causal_gate" not in k
                 ]
                 if real_missing:
                     print(
@@ -543,19 +528,6 @@ class LTX2DMD(nn.Module):
             if unexpected_g:
                 print(f"  [generator] unexpected keys ({len(unexpected_g)}): {unexpected_g[:10]}...")
 
-            sink_key = None
-            for k in gen_sd:
-                if "audio_sink_tokens" in k:
-                    sink_key = k
-                    break
-            if sink_key is not None:
-                for pname, param in self.generator.named_parameters():
-                    if "audio_sink_tokens" in pname:
-                        assert param.shape == gen_sd[sink_key].shape, (
-                            f"[Stage3] Sink token shape mismatch in generator: "
-                            f"model={param.shape} vs ckpt={gen_sd[sink_key].shape}"
-                        )
-                        break
             print("[Stage3] Generator checkpoint load complete")
 
         elif stage1_ckpt:
@@ -588,24 +560,6 @@ class LTX2DMD(nn.Module):
             else:
                 print("[Stage2] fake_score is bidirectional, skip Stage1 causal ckpt load for fake_score")
 
-            # Validate sink token shape consistency
-            sink_key = None
-            for k in gen_sd:
-                if "audio_sink_tokens" in k:
-                    sink_key = k
-                    break
-            if sink_key is not None:
-                models_to_check = [("generator", self.generator)]
-                if self.fake_score_use_causal_wrapper:
-                    models_to_check.append(("fake_score", self.fake_score))
-                for name, model in models_to_check:
-                    for pname, param in model.named_parameters():
-                        if "audio_sink_tokens" in pname:
-                            assert param.shape == gen_sd[sink_key].shape, (
-                                f"[Stage2] Sink token shape mismatch in {name}: "
-                                f"model={param.shape} vs ckpt={gen_sd[sink_key].shape}"
-                            )
-                            break
             print("[Stage2] Stage1 checkpoint load complete")
 
     def _round_align(self, value: float) -> int:
@@ -629,6 +583,7 @@ class LTX2DMD(nn.Module):
         return compute_av_blocks(
             total_video_latent_frames=num_video_frames,
             num_frame_per_block=self.num_frame_per_block,
+            num_frame_per_block_first=getattr(self.args, "num_frame_per_block_first", 4),
         )
 
     def _build_current_block_masks(
@@ -662,12 +617,14 @@ class LTX2DMD(nn.Module):
         num_video_frames: int,
     ) -> torch.Tensor:
         blocks = self._get_causal_blocks(num_video_frames)
-        if len(blocks) <= 1:
+        if len(blocks) < 1:
             raise ValueError(
-                f"Causal training requires at least one standard block, got {num_video_frames} video frames"
+                f"Causal training requires at least one block, got {num_video_frames} video frames"
             )
+        # New layout: Block 0 is a real generation block (4 video frames),
+        # not a Global Prefix. All blocks are valid supervision targets.
         return torch.randint(
-            1,
+            0,
             len(blocks),
             (batch_size,),
             device=self.device,
@@ -786,28 +743,12 @@ class LTX2DMD(nn.Module):
         )
 
     def _get_self_forcing_rollout_blocks(self, num_video_frames: int):
-        blocks = self._get_causal_blocks(num_video_frames)
-        standard_blocks = blocks[1:]
-        if not standard_blocks:
-            raise ValueError(
-                f"Self-forcing requires at least one standard causal block, got {num_video_frames} video frames"
-            )
+        """All blocks (including Block 0) participate in the rollout.
 
-        total_blocks = len(standard_blocks)
-        max_cfg = self.self_forcing_max_generated_blocks
-        if max_cfg is None:
-            max_blocks = total_blocks
-        else:
-            max_blocks = min(total_blocks, max(1, int(max_cfg)))
-
-        min_cfg = self.self_forcing_min_generated_blocks
-        if min_cfg is None:
-            min_blocks = max_blocks
-        else:
-            min_blocks = min(max_blocks, max(1, int(min_cfg)))
-
-        rollout_blocks = self._sample_synced_int(min_blocks, max_blocks)
-        return blocks[0], standard_blocks[:rollout_blocks]
+        With the 4-3-3-3-... layout there is no Global-Prefix special case,
+        so the entire video is generated autoregressively from noise.
+        """
+        return self._get_causal_blocks(num_video_frames)
 
     def _build_masks_for_blocks(
         self,
@@ -874,220 +815,60 @@ class LTX2DMD(nn.Module):
         )
         return self.add_noise(clean_block, torch.randn_like(clean_block), sigma)
 
-    def _run_prefix_rerun_block(
+    # ------------------------------------------------------------------
+    # KV-cache Self-Forcing rollout (mirrors Self-Forcing causal training
+    # pipeline `inference_with_trajectory`).
+    # ------------------------------------------------------------------
+
+    def _init_self_forcing_kv_caches(
         self,
-        *,
-        prev_video: torch.Tensor,
-        prev_audio: Optional[torch.Tensor],
-        block,
-        conditional_dict: Dict[str, Any],
-        requires_grad: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_size = prev_video.shape[0]
-        video_tail_shape = prev_video.shape[2:]
-        current_video = torch.randn(
-            (batch_size, block.video_frames, *video_tail_shape),
+        batch_size: int,
+        num_video_frames: int,
+        num_audio_frames: int,
+        text_seq_len: int,
+    ):
+        # Allocating cache tensors does not touch FSDP-sharded parameters,
+        # so it's safe to access the unwrapped wrapper.
+        generator_module = self._unwrap_module(self.generator)
+        return generator_module.init_av_kv_caches(
+            batch_size=batch_size,
+            max_video_frames=num_video_frames,
+            max_audio_frames=num_audio_frames,
+            text_seq_len=text_seq_len,
             device=self.device,
             dtype=self.dtype,
         )
-        current_audio = None
-        if prev_audio is not None:
-            current_audio = torch.randn(
-                (batch_size, block.audio_frames, prev_audio.shape[2]),
+
+    def _generate_exit_indices(self, num_blocks: int, num_denoising_steps: int) -> List[int]:
+        """Sample one exit denoising step per block, broadcast across ranks."""
+        if self.same_step_across_blocks:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                idx = torch.randint(
+                    low=0,
+                    high=num_denoising_steps,
+                    size=(1,),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                idx = torch.empty((1,), device=self.device, dtype=torch.long)
+            if dist.is_initialized():
+                dist.broadcast(idx, src=0)
+            return [int(idx.item())] * num_blocks
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            idx = torch.randint(
+                low=0,
+                high=num_denoising_steps,
+                size=(num_blocks,),
                 device=self.device,
-                dtype=self.dtype,
+                dtype=torch.long,
             )
-
-        was_training = self.generator.training
-        if not requires_grad:
-            self.generator.eval()
-
-        try:
-            grad_context = nullcontext() if requires_grad else torch.no_grad()
-            with grad_context:
-                for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
-                    prefix_video = torch.cat([prev_video, current_video], dim=1)
-                    video_sigma = torch.cat(
-                        [
-                            torch.zeros(
-                                (batch_size, prev_video.shape[1]),
-                                device=self.device,
-                                dtype=self.denoising_sigmas.dtype,
-                            ),
-                            sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
-                                batch_size, current_video.shape[1]
-                            ),
-                        ],
-                        dim=1,
-                    )
-
-                    prefix_audio = None
-                    audio_sigma = None
-                    if current_audio is not None and prev_audio is not None:
-                        prefix_audio = torch.cat([prev_audio, current_audio], dim=1)
-                        audio_sigma = torch.cat(
-                            [
-                                torch.zeros(
-                                    (batch_size, prev_audio.shape[1]),
-                                    device=self.device,
-                                    dtype=self.denoising_sigmas.dtype,
-                                ),
-                                sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
-                                    batch_size, current_audio.shape[1]
-                                ),
-                            ],
-                            dim=1,
-                        )
-
-                    pred_video_prefix, pred_audio_prefix = self.generator(
-                        noisy_image_or_video=prefix_video,
-                        conditional_dict=conditional_dict,
-                        timestep=video_sigma,
-                        noisy_audio=prefix_audio,
-                        audio_timestep=audio_sigma,
-                        use_causal_timestep=False,
-                        force_bidirectional=False,
-                    )
-
-                    current_video = pred_video_prefix[:, block.video_start:block.video_end]
-                    if current_audio is not None:
-                        if pred_audio_prefix is None:
-                            raise RuntimeError(
-                                "Generator returned no audio prediction during self-forcing rollout"
-                            )
-                        current_audio = pred_audio_prefix[:, block.audio_start:block.audio_end]
-
-                    next_sigma = self.denoising_sigmas[sigma_idx + 1]
-                    if float(next_sigma.item()) > 0.0:
-                        current_video = self._renoise_block(current_video, next_sigma)
-                        current_audio = self._renoise_block(current_audio, next_sigma)
-        finally:
-            if not requires_grad and was_training:
-                self.generator.train()
-
-        return current_video, current_audio
-
-    def _build_self_forcing_prefix_cache(
-        self,
-        prefix_video: torch.Tensor,
-        prefix_audio: Optional[torch.Tensor],
-        conditional_dict: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        if prefix_video.shape[1] == 0:
-            return None
-
-        with self._summon_generator_full_params():
-            generator_module = self._unwrap_module(self.generator)
-            kv_cache = None
-            prefix_blocks = self._get_causal_blocks(prefix_video.shape[1])
-
-            for block in prefix_blocks:
-                video_block = prefix_video[:, block.video_start:block.video_end]
-                audio_block = None
-                audio_sigma = None
-                if prefix_audio is not None:
-                    audio_end = min(block.audio_end, prefix_audio.shape[1])
-                    if audio_end > block.audio_start:
-                        audio_block = prefix_audio[:, block.audio_start:audio_end]
-                        audio_sigma = torch.zeros(
-                            (video_block.shape[0], audio_block.shape[1]),
-                            device=audio_block.device,
-                            dtype=self.denoising_sigmas.dtype,
-                        )
-
-                video_sigma = torch.zeros(
-                    (video_block.shape[0], video_block.shape[1]),
-                    device=video_block.device,
-                    dtype=self.denoising_sigmas.dtype,
-                )
-                _, _, kv_cache = generator_module.model.forward_inference(
-                    video_latent=video_block,
-                    audio_latent=audio_block,
-                    timesteps=video_sigma,
-                    audio_timesteps=audio_sigma,
-                    video_context=conditional_dict["video_context"],
-                    audio_context=conditional_dict["audio_context"],
-                    video_context_mask=conditional_dict.get("video_context_mask"),
-                    audio_context_mask=conditional_dict.get("audio_context_mask"),
-                    kv_cache=kv_cache,
-                    video_start_frame=block.video_start,
-                    audio_start_frame=block.audio_start,
-                    include_audio_sinks=(block.block_idx == 0),
-                )
-
-        return kv_cache
-
-    def _run_kv_rollout_block(
-        self,
-        *,
-        prev_video: torch.Tensor,
-        prev_audio: Optional[torch.Tensor],
-        block,
-        conditional_dict: Dict[str, Any],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        kv_cache = self._build_self_forcing_prefix_cache(prev_video, prev_audio, conditional_dict)
-
-        batch_size = prev_video.shape[0]
-        video_tail_shape = prev_video.shape[2:]
-        current_video = torch.randn(
-            (batch_size, block.video_frames, *video_tail_shape),
-            device=self.device,
-            dtype=self.dtype,
-        )
-        current_audio = None
-        if prev_audio is not None:
-            current_audio = torch.randn(
-                (batch_size, block.audio_frames, prev_audio.shape[2]),
-                device=self.device,
-                dtype=self.dtype,
-            )
-
-        with self._summon_generator_full_params():
-            generator_module = self._unwrap_module(self.generator)
-            for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
-                video_sigma = sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
-                    batch_size, current_video.shape[1]
-                )
-                audio_sigma = None
-                if current_audio is not None:
-                    audio_sigma = sigma.to(device=self.device, dtype=self.denoising_sigmas.dtype).expand(
-                        batch_size, current_audio.shape[1]
-                    )
-
-                pred_video, pred_audio, _ = generator_module.model.forward_inference(
-                    video_latent=current_video,
-                    audio_latent=current_audio,
-                    timesteps=video_sigma,
-                    audio_timesteps=audio_sigma,
-                    video_context=conditional_dict["video_context"],
-                    audio_context=conditional_dict["audio_context"],
-                    video_context_mask=conditional_dict.get("video_context_mask"),
-                    audio_context_mask=conditional_dict.get("audio_context_mask"),
-                    kv_cache=kv_cache,
-                    video_start_frame=block.video_start,
-                    audio_start_frame=block.audio_start,
-                    include_audio_sinks=False,
-                )
-
-                sigma_video_broadcast = self._reshape_sigma_for_block(video_sigma, current_video, generator_module)
-                current_video = (
-                    current_video.to(torch.float32)
-                    - pred_video.to(torch.float32) * sigma_video_broadcast.to(torch.float32)
-                ).to(self.dtype)
-
-                if current_audio is not None:
-                    sigma_audio_broadcast = self._reshape_sigma_for_block(audio_sigma, current_audio, generator_module)
-                    current_audio = (
-                        current_audio.to(torch.float32)
-                        - pred_audio.to(torch.float32) * sigma_audio_broadcast.to(torch.float32)
-                    ).to(self.dtype)
-
-                next_sigma = self.denoising_sigmas[sigma_idx + 1]
-                if float(next_sigma.item()) > 0.0:
-                    current_video = self._renoise_block(current_video, next_sigma)
-                    current_audio = self._renoise_block(current_audio, next_sigma)
-
-        return current_video, current_audio
+        else:
+            idx = torch.empty((num_blocks,), device=self.device, dtype=torch.long)
+        if dist.is_initialized():
+            dist.broadcast(idx, src=0)
+        return idx.tolist()
 
     def _run_self_forcing_rollout(
         self,
@@ -1095,63 +876,229 @@ class LTX2DMD(nn.Module):
         clean_video: torch.Tensor,
         clean_audio: Optional[torch.Tensor],
         conditional_dict: Dict[str, Any],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        List,
+        Dict[str, Any],
+    ]:
+        """KV-cache Self-Forcing rollout (Self-Forcing style, all blocks grad).
+
+        Every block runs its exit-step forward WITH gradient and writes its
+        prediction into a shared output tensor via in-place slice assignment,
+        preserving the autograd connection. A single `.backward()` on the
+        downstream DMD loss propagates gradients to ALL blocks simultaneously
+        — no multi-backward, fully FSDP-compatible.
+
+        Returns:
+            output_video: [B, F_v, ...] with autograd from all blocks.
+            output_audio: [B, F_a, ...] with autograd (or None).
+            rollout_blocks: block metadata list.
+            rollout_log: logging dict.
+        """
         if clean_video is None:
-            raise ValueError("Self-forcing rollout requires clean_video from ODE data")
-        if getattr(self.args, "backward_simulation", True):
-            raise ValueError("Self-forcing rollout requires backward_simulation=false")
+            raise ValueError("Self-forcing rollout requires clean_video to determine block layout")
 
-        prefix_block, rollout_blocks = self._get_self_forcing_rollout_blocks(clean_video.shape[1])
-        rollout_video = clean_video[:, prefix_block.video_start:prefix_block.video_end].clone()
-        rollout_audio = None
+        B = clean_video.shape[0]
+        total_video_frames = clean_video.shape[1]
+        rollout_blocks = self._get_self_forcing_rollout_blocks(total_video_frames)
+        num_blocks = len(rollout_blocks)
+
+        # Determine audio shape
         if clean_audio is not None:
-            audio_end = min(prefix_block.audio_end, clean_audio.shape[1])
-            rollout_audio = clean_audio[:, prefix_block.audio_start:audio_end].clone()
+            total_audio_frames = clean_audio.shape[1]
+            audio_channels = clean_audio.shape[2]
+        else:
+            total_audio_frames = rollout_blocks[-1].audio_end
+            audio_channels = None
 
-        for idx, block in enumerate(rollout_blocks):
-            is_last = idx == len(rollout_blocks) - 1
-            if self.self_forcing_runtime == "kv_cache" and not is_last:
-                current_video, current_audio = self._run_kv_rollout_block(
-                    prev_video=rollout_video,
-                    prev_audio=rollout_audio,
-                    block=block,
-                    conditional_dict=conditional_dict,
+        # Allocate KV caches once for the entire rollout.
+        text_seq_len = conditional_dict["video_context"].shape[1]
+        kv_caches = self._init_self_forcing_kv_caches(
+            batch_size=B,
+            num_video_frames=total_video_frames,
+            num_audio_frames=total_audio_frames,
+            text_seq_len=text_seq_len,
+        )
+
+        # Per-block exit step samples.
+        num_denoising_steps = len(self.denoising_sigmas) - 1
+        if num_denoising_steps <= 0:
+            raise ValueError("denoising_sigmas must have at least 2 entries (begin and end).")
+        exit_indices = self._generate_exit_indices(num_blocks, num_denoising_steps)
+
+        # Output tensors — all blocks write via in-place slice assignment,
+        # preserving autograd from each block's exit-step forward.
+        output_video = torch.zeros(
+            (B, total_video_frames, *clean_video.shape[2:]),
+            device=self.device, dtype=self.dtype,
+        )
+        output_audio = None
+        if audio_channels is not None:
+            output_audio = torch.zeros(
+                (B, total_audio_frames, audio_channels),
+                device=self.device, dtype=self.dtype,
+            )
+
+        for b_idx, block in enumerate(rollout_blocks):
+            v_len = block.video_end - block.video_start
+            a_len = block.audio_end - block.audio_start
+            video_tail_shape = clean_video.shape[2:]
+
+            noisy_v = torch.randn(
+                (B, v_len, *video_tail_shape),
+                device=self.device, dtype=self.dtype,
+            )
+            noisy_a = None
+            if output_audio is not None:
+                noisy_a = torch.randn(
+                    (B, a_len, audio_channels),
+                    device=self.device, dtype=self.dtype,
+                )
+
+            this_exit = exit_indices[b_idx]
+            denoised_v: Optional[torch.Tensor] = None
+            denoised_a: Optional[torch.Tensor] = None
+            v_sigma = None
+            a_sigma = None
+
+            for step_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                is_exit = (step_idx == this_exit)
+                v_sigma = sigma.to(
+                    device=self.device, dtype=self.denoising_sigmas.dtype
+                ).expand(B, v_len)
+                a_sigma = None
+                if noisy_a is not None:
+                    a_sigma = sigma.to(
+                        device=self.device, dtype=self.denoising_sigmas.dtype
+                    ).expand(B, a_len)
+
+                if b_idx == 0 or is_exit:
+                    mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                    mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    if rank == 0:
+                        print(f"[MEM] block={b_idx} step={step_idx} exit={is_exit} "
+                              f"alloc={mem_alloc:.1f}GB reserved={mem_reserved:.1f}GB")
+
+                if is_exit:
+                    # Snapshot KV cache "end" indices before this block's
+                    # forward. During backward recomputation, subsequent
+                    # blocks will have advanced these indices, so we restore
+                    # them to ensure the recomputed forward matches the original.
+                    kv_end_snapshot = []
+                    for layer_cache in kv_caches:
+                        snap = {}
+                        for attn_name, attn_cache in layer_cache.items():
+                            if isinstance(attn_cache, dict) and "end" in attn_cache:
+                                snap[attn_name] = attn_cache["end"].item()
+                        kv_end_snapshot.append(snap)
+
+                    def _exit_forward(nv, na, vs, as_, _dummy,
+                                      _kv=kv_caches, _snap=kv_end_snapshot,
+                                      _blk=block, _cd=conditional_dict):
+                        for lc, sn in zip(_kv, _snap):
+                            for aname, end_val in sn.items():
+                                lc[aname]["end"].fill_(end_val)
+                        return self.generator(
+                            noisy_image_or_video=nv,
+                            conditional_dict=_cd,
+                            timestep=vs,
+                            noisy_audio=na,
+                            audio_timestep=as_,
+                            kv_caches=_kv,
+                            current_video_start_frame=_blk.video_start,
+                            current_audio_start_frame=_blk.audio_start,
+                        )
+                    pred_v, pred_a = torch.utils.checkpoint.checkpoint(
+                        _exit_forward, noisy_v, noisy_a, v_sigma, a_sigma,
+                        torch.tensor(0.0, device=self.device, requires_grad=True),
+                        use_reentrant=True,
+                    )
+                else:
+                    with torch.no_grad():
+                        pred_v, pred_a = self.generator(
+                            noisy_image_or_video=noisy_v,
+                            conditional_dict=conditional_dict,
+                            timestep=v_sigma,
+                            noisy_audio=noisy_a,
+                            audio_timestep=a_sigma,
+                            kv_caches=kv_caches,
+                            current_video_start_frame=block.video_start,
+                            current_audio_start_frame=block.audio_start,
+                        )
+
+                if is_exit:
+                    denoised_v = pred_v
+                    denoised_a = pred_a
+                    break
+
+                next_sigma = self.denoising_sigmas[step_idx + 1]
+                if float(next_sigma.item()) > 0.0:
+                    noisy_v = self._renoise_block(pred_v.detach(), next_sigma)
+                    if pred_a is not None:
+                        noisy_a = self._renoise_block(pred_a.detach(), next_sigma)
+                else:
+                    noisy_v = pred_v.detach()
+                    if pred_a is not None:
+                        noisy_a = pred_a.detach()
+
+            # Write to output tensor — autograd retained via slice assignment.
+            output_video[:, block.video_start:block.video_end] = denoised_v
+            if output_audio is not None and denoised_a is not None:
+                output_audio[:, block.audio_start:block.audio_end] = denoised_a
+
+            # === Context-noise cache refresh (always no_grad) ===
+            ctx_t = float(self.context_noise) / float(self.num_train_timestep)
+            ctx_sigma_v = torch.full_like(v_sigma, ctx_t)
+            if ctx_t > 0.0:
+                noisy_ctx_v = self.add_noise(
+                    denoised_v.detach(),
+                    torch.randn_like(denoised_v),
+                    ctx_sigma_v,
                 )
             else:
-                current_video, current_audio = self._run_prefix_rerun_block(
-                    prev_video=rollout_video,
-                    prev_audio=rollout_audio,
-                    block=block,
+                noisy_ctx_v = denoised_v.detach()
+
+            noisy_ctx_a = None
+            ctx_sigma_a = None
+            if denoised_a is not None and a_sigma is not None:
+                ctx_sigma_a = torch.full_like(a_sigma, ctx_t)
+                if ctx_t > 0.0:
+                    noisy_ctx_a = self.add_noise(
+                        denoised_a.detach(),
+                        torch.randn_like(denoised_a),
+                        ctx_sigma_a,
+                    )
+                else:
+                    noisy_ctx_a = denoised_a.detach()
+
+            with torch.no_grad():
+                self.generator(
+                    noisy_image_or_video=noisy_ctx_v,
                     conditional_dict=conditional_dict,
-                    requires_grad=is_last,
+                    timestep=ctx_sigma_v,
+                    noisy_audio=noisy_ctx_a,
+                    audio_timestep=ctx_sigma_a,
+                    kv_caches=kv_caches,
+                    current_video_start_frame=block.video_start,
+                    current_audio_start_frame=block.audio_start,
                 )
 
-            if not is_last:
-                current_video = current_video.detach()
-                if current_audio is not None:
-                    current_audio = current_audio.detach()
-
-            rollout_video = torch.cat([rollout_video, current_video], dim=1)
-            if current_audio is not None:
-                if rollout_audio is None:
-                    rollout_audio = current_audio
-                else:
-                    rollout_audio = torch.cat([rollout_audio, current_audio], dim=1)
-
-        num_audio_frames = rollout_audio.shape[1] if rollout_audio is not None else 0
-        video_loss_mask, audio_loss_mask = self._build_masks_for_blocks(
-            batch_size=rollout_video.shape[0],
-            num_video_frames=rollout_video.shape[1],
-            num_audio_frames=num_audio_frames,
-            blocks=[rollout_blocks[-1]],
-        )
+        num_audio_frames = output_audio.shape[1] if output_audio is not None else 0
         rollout_log = {
-            "self_forcing_rollout_blocks": len(rollout_blocks),
-            "self_forcing_rollout_video_frames": rollout_video.shape[1],
-            "self_forcing_rollout_audio_frames": num_audio_frames,
-            "self_forcing_runtime": 0 if self.self_forcing_runtime == "prefix_rerun" else 1,
+            "self_forcing_num_blocks": num_blocks,
+            "self_forcing_grad_blocks": num_blocks,
+            "self_forcing_video_frames": total_video_frames,
+            "self_forcing_audio_frames": num_audio_frames,
+            "self_forcing_context_noise": self.context_noise,
         }
-        return rollout_video, rollout_audio, video_loss_mask, audio_loss_mask, rollout_log
+        return (
+            output_video,
+            output_audio,
+            rollout_blocks,
+            rollout_log,
+        )
 
     def _process_timestep(self, timestep: torch.Tensor, task_type: str) -> torch.Tensor:
         """
@@ -1173,12 +1120,18 @@ class LTX2DMD(nn.Module):
             return timestep
         elif "causal" in task_type:
             result = timestep.clone()
-            if result.shape[1] <= 1:
+            B, F = result.shape
+            if F <= 1:
                 return result
-            idx = 1
-            while idx < result.shape[1]:
-                end = min(idx + self.num_frame_per_block, result.shape[1])
-                result[:, idx:end] = result[:, idx:idx + 1].expand(-1, end - idx)
+            # Block 0: num_frame_per_block_first frames share one timestep
+            first_block = getattr(self.args, "num_frame_per_block_first", 4)
+            end0 = min(first_block, F)
+            result[:, :end0] = result[:, :1].expand(B, end0)
+            # Remaining blocks: num_frame_per_block frames each
+            idx = end0
+            while idx < F:
+                end = min(idx + self.num_frame_per_block, F)
+                result[:, idx:end] = result[:, idx:idx + 1].expand(B, end - idx)
                 idx = end
             return result
         else:
@@ -1617,24 +1570,24 @@ class LTX2DMD(nn.Module):
         F_a = audio_latent.shape[1]
 
         with torch.no_grad():
-            if video_loss_mask is not None and audio_loss_mask is not None:
-                video_timestep, audio_timestep = self._sample_causal_supervision_timesteps(
-                    B,
-                    video_loss_mask,
-                    audio_loss_mask,
-                )
-            else:
-                video_timestep = torch.randint(
-                    0, self.num_train_timestep,
-                    [B, F_v],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                video_timestep = self._process_timestep(video_timestep, self.real_task_type)
-                video_timestep = video_timestep.clamp(self.min_step, self.max_step)
-                audio_timestep = self._compute_audio_timestep(
-                    video_timestep, F_a, task_type=self.real_task_type
-                )
+            # Always sample uniform sigma across all frames. real_score is a
+            # bidirectional teacher trained with same-sigma-per-sample inputs
+            # (Stage 1 DMD). Feeding it mixed-sigma inputs (e.g. "mask frames
+            # noisy, context frames clean") is OOD and gives garbage predictions,
+            # corrupting the KL gradient. The video_loss_mask is still honored
+            # downstream in the normalizer and MSE averaging, so it only
+            # restricts *which* frames contribute gradient, not the sigma pattern.
+            video_timestep = torch.randint(
+                0, self.num_train_timestep,
+                [B, F_v],
+                device=self.device,
+                dtype=torch.long,
+            )
+            video_timestep = self._process_timestep(video_timestep, self.real_task_type)
+            video_timestep = video_timestep.clamp(self.min_step, self.max_step)
+            audio_timestep = self._compute_audio_timestep(
+                video_timestep, F_a, task_type=self.real_task_type
+            )
 
             video_sigma = self.timestep_to_sigma(video_timestep)
             audio_sigma = self.timestep_to_sigma(audio_timestep)
@@ -1783,14 +1736,17 @@ class LTX2DMD(nn.Module):
         rollout_log: Dict[str, Any] = {}
 
         if self.enable_self_forcing:
-            pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = (
-                self._run_self_forcing_rollout(
-                    clean_video=clean_video,
-                    clean_audio=clean_audio,
-                    conditional_dict=conditional_dict,
-                )
+            (
+                output_video,
+                output_audio,
+                _rollout_blocks,
+                rollout_log,
+            ) = self._run_self_forcing_rollout(
+                clean_video=clean_video,
+                clean_audio=clean_audio,
+                conditional_dict=conditional_dict,
             )
-            return pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log
+            return output_video, output_audio, None, None, rollout_log
 
         # Step 1: Backward simulation or ODE data
         if getattr(self.args, "backward_simulation", True):
@@ -1913,21 +1869,16 @@ class LTX2DMD(nn.Module):
         clean_video: Optional[torch.Tensor] = None,
         clean_audio: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """
-        Compute generator loss using DMD.
+        """Compute generator loss using DMD."""
+        if self.enable_self_forcing:
+            return self._generator_loss_self_forcing_blockwise(
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                clean_video=clean_video,
+                clean_audio=clean_audio,
+            )
 
-        Args:
-            video_shape: [B, F, C, H, W]
-            audio_shape: [B, F_a, C]
-            conditional_dict: Conditional embeddings
-            unconditional_dict: Unconditional embeddings
-            clean_video: Clean video latent (optional, for non-backward-simulation)
-            clean_audio: Clean audio latent (optional)
-
-        Returns:
-            Tuple of (loss, log_dict)
-        """
-        # Run generator
+        # Non-self-forcing path (Stage 1 bidirectional DMD, etc.)
         pred_video, pred_audio, video_loss_mask, audio_loss_mask, rollout_log = self._run_generator(
             video_shape=video_shape,
             audio_shape=audio_shape,
@@ -1936,7 +1887,6 @@ class LTX2DMD(nn.Module):
             clean_audio=clean_audio,
         )
 
-        # Compute DMD loss
         dmd_loss, log_dict = self.compute_distribution_matching_loss(
             video_latent=pred_video,
             audio_latent=pred_audio,
@@ -1948,6 +1898,536 @@ class LTX2DMD(nn.Module):
         log_dict.update(rollout_log)
 
         return dmd_loss, log_dict
+
+    _offload_pack_count = 0
+    _offload_pack_bytes = 0
+
+    @staticmethod
+    def _offload_pack(tensor):
+        size = tensor.numel() * tensor.element_size()
+        if size > 50_000_000:  # > 50 MB
+            LTX2DMD._offload_pack_count += 1
+            LTX2DMD._offload_pack_bytes += size
+            return tensor.to("cpu", non_blocking=True)
+        return tensor
+
+    @staticmethod
+    def _offload_unpack(tensor):
+        if tensor.device.type == "cpu":
+            return tensor.cuda(non_blocking=True)
+        return tensor
+
+    def _generator_loss_self_forcing_blockwise(
+        self,
+        *,
+        conditional_dict: Dict[str, Any],
+        unconditional_dict: Dict[str, Any],
+        clean_video: Optional[torch.Tensor],
+        clean_audio: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Self-Forcing generator loss (all blocks, single backward).
+
+        Matches the Self-Forcing reference: all blocks' exit-step predictions
+        are written into a single output tensor with autograd retained.
+        The DMD loss is computed over the entire output, and a single
+        `.backward()` call propagates gradient to all blocks simultaneously.
+
+        Uses saved_tensors_hooks to offload large FSDP parameter references
+        to CPU during forward, preventing OOM from 5 blocks' autograd graphs
+        holding ~25 GB each of all-gathered parameters simultaneously.
+        """
+        (
+            output_video,
+            output_audio,
+            rollout_blocks,
+            rollout_log,
+        ) = self._run_self_forcing_rollout(
+            clean_video=clean_video,
+            clean_audio=clean_audio,
+            conditional_dict=conditional_dict,
+        )
+
+        dmd_loss, log_dict = self.compute_distribution_matching_loss(
+            video_latent=output_video,
+            audio_latent=output_audio,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            video_loss_mask=None,
+            audio_loss_mask=None,
+        )
+        log_dict.update(rollout_log)
+
+        return dmd_loss, log_dict
+
+    def _generator_loss_self_forcing_two_pass(
+        self,
+        *,
+        conditional_dict: Dict[str, Any],
+        unconditional_dict: Dict[str, Any],
+        clean_video: Optional[torch.Tensor],
+        clean_audio: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Two-pass Self-Forcing generator loss. ALL blocks carry gradient.
+
+        Peak activation memory ≈ ONE block's exit-step forward. The two-pass
+        design serializes across blocks so we never hold >1 block's autograd
+        graph at a time:
+
+          Pass 1: full no_grad rollout → rollout_video_detached (no activations).
+          compute grad_full: no_grad real/fake score over the full detached
+                             video at uniform sigma (bidirectional-teacher
+                             in-distribution, matching Self-Forcing).
+          Pass 2: per block, PAIRED forward→loss→backward→free.
+
+        To keep Pass 1 and Pass 2 producing bit-identical rollouts (so that
+        the target used for backward comes from the SAME x0 that Pass 2 is
+        generating), we save CUDA+CPU RNG state before Pass 1 and restore it
+        before Pass 2. All `torch.randn` / `torch.randperm` / broadcast draws
+        replay exactly.
+
+        Context-noise refresh in Pass 2 uses `rollout_video_detached[:, slc]`
+        (Pass 1's clean x0) — this is detached regardless of Pass 2 grad state
+        and keeps the KV cache bit-identical between passes.
+
+        Cost: roughly 2× Self-Forcing's rollout forward count (Pass 1 full
+        rollout + Pass 2 denoising loops). Backward cost is unchanged
+        (backward fires once per block, vs single backward over the whole
+        video). Wall clock ~1.5-2× K=1, in exchange for N× per-iter gradient
+        signal (where N = num_blocks).
+        """
+        if clean_video is None:
+            raise ValueError("Self-forcing two-pass requires clean_video for block layout")
+
+        B = clean_video.shape[0]
+        total_video_frames = clean_video.shape[1]
+        rollout_blocks = self._get_self_forcing_rollout_blocks(total_video_frames)
+        num_blocks = len(rollout_blocks)
+
+        if clean_audio is not None:
+            total_audio_frames = clean_audio.shape[1]
+            audio_channels = clean_audio.shape[2]
+        else:
+            total_audio_frames = rollout_blocks[-1].audio_end
+            audio_channels = None
+
+        num_denoising_steps = len(self.denoising_sigmas) - 1
+        if num_denoising_steps <= 0:
+            raise ValueError("denoising_sigmas must have at least 2 entries.")
+
+        text_seq_len = conditional_dict["video_context"].shape[1]
+        video_tail_shape = clean_video.shape[2:]
+
+        # Save RNG so Pass 2 replays Pass 1's randomness byte-for-byte.
+        rng_state_cuda = torch.cuda.get_rng_state()
+        rng_state_cpu = torch.get_rng_state()
+
+        # ---- Pass 1: full no_grad rollout ----
+        rollout_video_detached = torch.zeros(
+            (B, total_video_frames, *video_tail_shape),
+            device=self.device, dtype=self.dtype,
+        )
+        rollout_audio_detached = None
+        if audio_channels is not None:
+            rollout_audio_detached = torch.zeros(
+                (B, total_audio_frames, audio_channels),
+                device=self.device, dtype=self.dtype,
+            )
+
+        with torch.no_grad():
+            kv_caches_p1 = self._init_self_forcing_kv_caches(
+                batch_size=B,
+                num_video_frames=total_video_frames,
+                num_audio_frames=total_audio_frames,
+                text_seq_len=text_seq_len,
+            )
+            exit_indices_p1 = self._generate_exit_indices(num_blocks, num_denoising_steps)
+
+            for b_idx, block in enumerate(rollout_blocks):
+                v_len = block.video_end - block.video_start
+                a_len = block.audio_end - block.audio_start
+                noisy_v = torch.randn(
+                    (B, v_len, *video_tail_shape),
+                    device=self.device, dtype=self.dtype,
+                )
+                noisy_a = None
+                if rollout_audio_detached is not None:
+                    noisy_a = torch.randn(
+                        (B, a_len, audio_channels),
+                        device=self.device, dtype=self.dtype,
+                    )
+
+                this_exit = exit_indices_p1[b_idx]
+                denoised_v_p1 = None
+                denoised_a_p1 = None
+                v_sigma = None
+                a_sigma = None
+
+                for step_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                    v_sigma = sigma.to(
+                        device=self.device, dtype=self.denoising_sigmas.dtype
+                    ).expand(B, v_len)
+                    if noisy_a is not None:
+                        a_sigma = sigma.to(
+                            device=self.device, dtype=self.denoising_sigmas.dtype
+                        ).expand(B, a_len)
+
+                    pred_v, pred_a = self.generator(
+                        noisy_image_or_video=noisy_v,
+                        conditional_dict=conditional_dict,
+                        timestep=v_sigma,
+                        noisy_audio=noisy_a,
+                        audio_timestep=a_sigma,
+                        kv_caches=kv_caches_p1,
+                        current_video_start_frame=block.video_start,
+                        current_audio_start_frame=block.audio_start,
+                    )
+
+                    if step_idx == this_exit:
+                        denoised_v_p1 = pred_v
+                        denoised_a_p1 = pred_a
+                        break
+
+                    next_sigma = self.denoising_sigmas[step_idx + 1]
+                    if float(next_sigma.item()) > 0.0:
+                        noisy_v = self._renoise_block(pred_v, next_sigma)
+                        if pred_a is not None:
+                            noisy_a = self._renoise_block(pred_a, next_sigma)
+                    else:
+                        noisy_v = pred_v
+                        if pred_a is not None:
+                            noisy_a = pred_a
+                else:
+                    denoised_v_p1 = pred_v
+                    denoised_a_p1 = pred_a
+
+                rollout_video_detached[:, block.video_start:block.video_end] = denoised_v_p1
+                if rollout_audio_detached is not None and denoised_a_p1 is not None:
+                    rollout_audio_detached[:, block.audio_start:block.audio_end] = denoised_a_p1
+
+                # Context-noise refresh (writes cache for next block).
+                ctx_t = float(self.context_noise) / float(self.num_train_timestep)
+                ctx_sigma_v = torch.full_like(v_sigma, ctx_t)
+                if ctx_t > 0.0:
+                    noisy_ctx_v = self.add_noise(
+                        denoised_v_p1, torch.randn_like(denoised_v_p1), ctx_sigma_v,
+                    )
+                else:
+                    noisy_ctx_v = denoised_v_p1
+
+                noisy_ctx_a = None
+                ctx_sigma_a = None
+                if denoised_a_p1 is not None and a_sigma is not None:
+                    ctx_sigma_a = torch.full_like(a_sigma, ctx_t)
+                    if ctx_t > 0.0:
+                        noisy_ctx_a = self.add_noise(
+                            denoised_a_p1, torch.randn_like(denoised_a_p1), ctx_sigma_a,
+                        )
+                    else:
+                        noisy_ctx_a = denoised_a_p1
+
+                self.generator(
+                    noisy_image_or_video=noisy_ctx_v,
+                    conditional_dict=conditional_dict,
+                    timestep=ctx_sigma_v,
+                    noisy_audio=noisy_ctx_a,
+                    audio_timestep=ctx_sigma_a,
+                    kv_caches=kv_caches_p1,
+                    current_video_start_frame=block.video_start,
+                    current_audio_start_frame=block.audio_start,
+                )
+
+        # Free Pass 1 cache before Pass 2 allocates a fresh one.
+        del kv_caches_p1
+        torch.cuda.empty_cache()
+
+        F_v = rollout_video_detached.shape[1]
+        F_a = rollout_audio_detached.shape[1] if rollout_audio_detached is not None else 0
+
+        # ---- Compute full-video KL gradient (no_grad, uniform sigma) ----
+        with torch.no_grad():
+            video_timestep = torch.randint(
+                0, self.num_train_timestep,
+                [B, F_v],
+                device=self.device, dtype=torch.long,
+            )
+            video_timestep = self._process_timestep(video_timestep, self.real_task_type)
+            video_timestep = video_timestep.clamp(self.min_step, self.max_step)
+            audio_timestep = self._compute_audio_timestep(
+                video_timestep, F_a, task_type=self.real_task_type
+            )
+            video_sigma_kl = self.timestep_to_sigma(video_timestep)
+            audio_sigma_kl = self.timestep_to_sigma(audio_timestep)
+
+            if self.dmd_latent_mode == "teacher_denoise":
+                noisy_video, noisy_audio, video_sigma_kl, audio_sigma_kl = (
+                    self._get_noisy_latent_via_teacher_denoise(
+                        clean_video=rollout_video_detached,
+                        clean_audio=rollout_audio_detached,
+                        target_video_sigma=video_sigma_kl,
+                        target_audio_sigma=audio_sigma_kl,
+                        conditional_dict=conditional_dict,
+                        unconditional_dict=unconditional_dict,
+                    )
+                )
+            else:
+                noise_video = torch.randn_like(rollout_video_detached)
+                noisy_video = self.add_noise(
+                    rollout_video_detached.flatten(0, 1),
+                    noise_video.flatten(0, 1),
+                    video_sigma_kl.flatten(0, 1),
+                ).unflatten(0, (B, F_v))
+                if rollout_audio_detached is not None:
+                    noise_audio = torch.randn_like(rollout_audio_detached)
+                    noisy_audio = self.add_noise(
+                        rollout_audio_detached, noise_audio, audio_sigma_kl,
+                    )
+                else:
+                    noisy_audio = None
+
+            grad_video, grad_audio, log_dict = self._compute_kl_grad(
+                noisy_video=noisy_video,
+                noisy_audio=noisy_audio if noisy_audio is not None else rollout_video_detached,
+                clean_video=rollout_video_detached,
+                clean_audio=(
+                    rollout_audio_detached if rollout_audio_detached is not None else rollout_video_detached
+                ),
+                video_sigma=video_sigma_kl,
+                audio_sigma=audio_sigma_kl if rollout_audio_detached is not None else video_sigma_kl,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                video_loss_mask=None,
+                audio_loss_mask=None,
+            )
+
+        # ---- Restore RNG so Pass 2 replays Pass 1's randomness ----
+        torch.cuda.set_rng_state(rng_state_cuda)
+        torch.set_rng_state(rng_state_cpu)
+
+        # ---- Pass 2: per-block paired forward+backward ----
+        video_block_w = self._compute_block_weights(F_v)
+        audio_block_w = (
+            self._compute_block_weights(F_a, is_audio=True) if F_a > 0 else None
+        )
+        video_w, audio_w = self.get_loss_weights()
+
+        # Mask-only normalization. With all-blocks-grad, the "mask" covers
+        # the whole video, so denom = B × F_v (equivalent to Self-Forcing's
+        # unmasked F.mse_loss reduction='mean').
+        video_denom = B * F_v
+        audio_denom = B * F_a if F_a > 0 else 1
+
+        total_loss_scalar = 0.0
+        total_video_loss_scalar = 0.0
+        total_audio_loss_scalar = 0.0
+        audio_blocks_counted = 0
+
+        # Fresh KV cache for Pass 2 (filled block-by-block).
+        kv_caches_p2 = self._init_self_forcing_kv_caches(
+            batch_size=B,
+            num_video_frames=total_video_frames,
+            num_audio_frames=total_audio_frames,
+            text_seq_len=text_seq_len,
+        )
+        # RNG-restored → identical exit indices as Pass 1.
+        exit_indices_p2 = self._generate_exit_indices(num_blocks, num_denoising_steps)
+
+        fsdp_no_sync = getattr(self.generator, "no_sync", None)
+
+        for b_idx, block in enumerate(rollout_blocks):
+            # FSDP `no_sync` semantics (per PyTorch docs): the ENTIRE
+            # forward-backward pair must be inside the context for gradient
+            # accumulation to work. The reduce-scatter is deferred and fires
+            # on the first backward AFTER exiting the context. Wrapping only
+            # the backward (as the previous attempt did) leaves FSDP unable
+            # to recognize the accumulation pattern, so the sharded grad
+            # buffer ends up empty and `clip_grad_norm_` warns with zero.
+            #
+            # So: all but the last block run ALL ops (rollout forward +
+            # loss + backward + context-noise refresh) inside no_sync.
+            # The last block runs everything outside, which triggers
+            # reduce-scatter once with the sum of all per-block gradients.
+            is_last_block = (b_idx == num_blocks - 1)
+            if not is_last_block and callable(fsdp_no_sync):
+                block_ctx = fsdp_no_sync()
+            else:
+                block_ctx = nullcontext()
+
+            with block_ctx:
+                v_len = block.video_end - block.video_start
+                a_len = block.audio_end - block.audio_start
+
+                # Same initial noise as Pass 1 (RNG restored).
+                noisy_v = torch.randn(
+                    (B, v_len, *video_tail_shape),
+                    device=self.device, dtype=self.dtype,
+                )
+                noisy_a = None
+                if rollout_audio_detached is not None:
+                    noisy_a = torch.randn(
+                        (B, a_len, audio_channels),
+                        device=self.device, dtype=self.dtype,
+                    )
+
+                this_exit = exit_indices_p2[b_idx]
+                denoised_v = None
+                denoised_a = None
+                v_sigma = None
+                a_sigma = None
+
+                for step_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+                    need_grad = (step_idx == this_exit)
+                    grad_ctx = nullcontext() if need_grad else torch.no_grad()
+                    v_sigma = sigma.to(
+                        device=self.device, dtype=self.denoising_sigmas.dtype
+                    ).expand(B, v_len)
+                    if noisy_a is not None:
+                        a_sigma = sigma.to(
+                            device=self.device, dtype=self.denoising_sigmas.dtype
+                        ).expand(B, a_len)
+
+                    with grad_ctx:
+                        pred_v, pred_a = self.generator(
+                            noisy_image_or_video=noisy_v,
+                            conditional_dict=conditional_dict,
+                            timestep=v_sigma,
+                            noisy_audio=noisy_a,
+                            audio_timestep=a_sigma,
+                            kv_caches=kv_caches_p2,
+                            current_video_start_frame=block.video_start,
+                            current_audio_start_frame=block.audio_start,
+                        )
+
+                    if need_grad:
+                        denoised_v = pred_v
+                        denoised_a = pred_a
+                        break
+
+                    next_sigma = self.denoising_sigmas[step_idx + 1]
+                    if float(next_sigma.item()) > 0.0:
+                        noisy_v = self._renoise_block(pred_v.detach(), next_sigma)
+                        if pred_a is not None:
+                            noisy_a = self._renoise_block(pred_a.detach(), next_sigma)
+                    else:
+                        noisy_v = pred_v.detach()
+                        if pred_a is not None:
+                            noisy_a = pred_a.detach()
+                else:
+                    denoised_v = pred_v
+                    denoised_a = pred_a
+
+                # Per-block MSE loss on THIS block's grad-bearing prediction.
+                slc_v = slice(block.video_start, block.video_end)
+                target_v = (denoised_v.detach() - grad_video[:, slc_v]).detach()
+                v_diff = denoised_v.double() - target_v.double()
+                v_per_frame = (v_diff ** 2).mean(dim=[2, 3, 4])
+                block_w_v = video_block_w[slc_v].unsqueeze(0)
+                video_loss_block = 0.5 * (v_per_frame * block_w_v).sum() / float(video_denom)
+
+                audio_loss_block = None
+                if (
+                    denoised_a is not None
+                    and grad_audio is not None
+                    and audio_block_w is not None
+                ):
+                    audio_end_clamped = min(block.audio_end, F_a)
+                    if audio_end_clamped > block.audio_start:
+                        slc_a = slice(block.audio_start, audio_end_clamped)
+                        target_a = (denoised_a.detach() - grad_audio[:, slc_a]).detach()
+                        a_diff = denoised_a.double() - target_a.double()
+                        a_per_frame = (a_diff ** 2).mean(dim=2)
+                        block_w_a = audio_block_w[slc_a].unsqueeze(0)
+                        audio_loss_block = 0.5 * (a_per_frame * block_w_a).sum() / float(audio_denom)
+
+                if audio_loss_block is not None:
+                    loss_block = video_w * video_loss_block + audio_w * audio_loss_block
+                else:
+                    loss_block = video_w * video_loss_block
+
+                # Paired backward INSIDE the per-block no_sync context (for
+                # all but the last block). FSDP recognizes the full
+                # forward-backward cycle inside the context and defers
+                # reduce-scatter. The last block's backward runs outside
+                # (block_ctx = nullcontext), triggering reduce-scatter on
+                # the accumulated per-block gradients.
+                loss_block.backward()
+
+                total_loss_scalar += float(loss_block.detach().item())
+                total_video_loss_scalar += float(video_loss_block.detach().item())
+                if audio_loss_block is not None:
+                    total_audio_loss_scalar += float(audio_loss_block.detach().item())
+                    audio_blocks_counted += 1
+
+                # Context-noise refresh writes KV cache for the next block.
+                # Use Pass 1's DETACHED denoised slice (bit-identical to Pass 2's
+                # under RNG restore) so the cache state after refresh matches what
+                # the next block would see at inference time, and so that this
+                # refresh never holds gradient references.
+                ctx_t = float(self.context_noise) / float(self.num_train_timestep)
+                ctx_sigma_v = torch.full_like(v_sigma, ctx_t)
+                detached_v_slice = rollout_video_detached[:, block.video_start:block.video_end]
+                if ctx_t > 0.0:
+                    noisy_ctx_v = self.add_noise(
+                        detached_v_slice, torch.randn_like(detached_v_slice), ctx_sigma_v,
+                    )
+                else:
+                    noisy_ctx_v = detached_v_slice
+
+                noisy_ctx_a = None
+                ctx_sigma_a = None
+                if rollout_audio_detached is not None and a_sigma is not None:
+                    audio_end_clamped = min(block.audio_end, F_a)
+                    if audio_end_clamped > block.audio_start:
+                        detached_a_slice = rollout_audio_detached[
+                            :, block.audio_start:audio_end_clamped
+                        ]
+                        ctx_sigma_a = torch.full_like(a_sigma, ctx_t)
+                        if ctx_t > 0.0:
+                            noisy_ctx_a = self.add_noise(
+                                detached_a_slice,
+                                torch.randn_like(detached_a_slice),
+                                ctx_sigma_a,
+                            )
+                        else:
+                            noisy_ctx_a = detached_a_slice
+
+                with torch.no_grad():
+                    self.generator(
+                        noisy_image_or_video=noisy_ctx_v,
+                        conditional_dict=conditional_dict,
+                        timestep=ctx_sigma_v,
+                        noisy_audio=noisy_ctx_a,
+                        audio_timestep=ctx_sigma_a,
+                        kv_caches=kv_caches_p2,
+                        current_video_start_frame=block.video_start,
+                        current_audio_start_frame=block.audio_start,
+                    )
+
+                # Drop references so PyTorch frees this block's autograd graph
+                # before the next block allocates.
+                del denoised_v, target_v, v_diff, v_per_frame, video_loss_block, loss_block
+                if audio_loss_block is not None:
+                    del denoised_a, target_a, a_diff, a_per_frame, audio_loss_block
+
+        # Each per-block loss is already normalized by the full-video/full-audio
+        # denominator (B × F_v / B × F_a), so summing across blocks yields the
+        # full-video / full-audio MSE directly (matches Self-Forcing's
+        # unmasked `F.mse_loss` reduction='mean' semantics).
+        log_dict["video_dmd_loss"] = total_video_loss_scalar
+        log_dict["audio_dmd_loss"] = total_audio_loss_scalar
+        log_dict["video_loss_weight"] = video_w
+        log_dict["audio_loss_weight"] = audio_w
+        log_dict["alignment/video_sigma_mean"] = video_sigma_kl.float().mean().item()
+        log_dict["alignment/audio_sigma_mean"] = audio_sigma_kl.float().mean().item()
+        log_dict["self_forcing_num_blocks"] = num_blocks
+        log_dict["self_forcing_grad_blocks"] = num_blocks  # ALL blocks
+        log_dict["self_forcing_video_frames"] = F_v
+        log_dict["self_forcing_audio_frames"] = F_a
+        log_dict["self_forcing_context_noise"] = self.context_noise
+
+        # Backward already ran per block — return no-grad scalar tensor so the
+        # trainer's `if requires_grad: backward()` check skips the outer
+        # backward call.
+        return torch.tensor(total_loss_scalar, device=self.device), log_dict
 
     def critic_loss(
         self,

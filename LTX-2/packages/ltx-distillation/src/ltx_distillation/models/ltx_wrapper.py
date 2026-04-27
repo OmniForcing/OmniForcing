@@ -408,8 +408,11 @@ class LTX2DiffusionWrapper(nn.Module):
                 enabled=True,
             )
 
-        # Forward through model
-        perturbations = BatchedPerturbationConfig.empty(batch_size=B)
+        # Forward through model.
+        # Accept external perturbations for STG/modality-isolation passes.
+        perturbations = kwargs.get("perturbations", None)
+        if perturbations is None:
+            perturbations = BatchedPerturbationConfig.empty(batch_size=B)
 
         # The model returns x0 predictions (X0Model wraps velocity model)
         video_x0, audio_x0 = self.model(
@@ -444,6 +447,7 @@ def create_ltx2_wrapper(
     dtype: torch.dtype = torch.bfloat16,
     video_height: int = 512,
     video_width: int = 768,
+    registry=None,
 ) -> LTX2DiffusionWrapper:
     """
     Factory function to create LTX2DiffusionWrapper from checkpoint.

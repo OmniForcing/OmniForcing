@@ -49,17 +49,19 @@ class CausalMaskConfig:
     # Audio tokens per frame (typically 1 for LTX-2)
     audio_frame_seqlen: int = 1
 
-    # Block size for causal generation (3 video frames = 1 second = 25 audio frames)
+    # Block 0 size: 4 video frames + 26 audio frames (absorbs VAE causal-fix asymmetry).
+    num_frame_per_block_first: int = 4
+
+    # Standard block size: 3 video frames + 25 audio frames (1 second).
     num_frame_per_block: int = 3
 
-    # Number of learnable sink tokens prepended to audio sequence.
-    # Sinks are part of Block 0, visible to all audio via causal masking.
-    # They use identity RoPE (cos=1, sin=0) and are NOT supervised.
-    num_audio_sink_tokens: int = 0
-
     def get_audio_block_size(self) -> int:
-        """Audio frames per video block: exactly 25 (1 second = 3 video : 25 audio)."""
+        """Audio frames per standard video block: 25 (1 second = 3 video : 25 audio)."""
         return 25
+
+    def get_audio_first_block_size(self) -> int:
+        """Audio frames in Block 0: 26 (1 + 25 == 4 + 4*3, 26 + 4*25 = 126)."""
+        return 26
 
 
 @dataclass
@@ -146,14 +148,23 @@ def get_audio_range_for_video_frame(video_frame: int) -> tuple[int, int]:
 def compute_num_blocks(
     total_video_latent_frames: int,
     num_frame_per_block: int = 3,
+    num_frame_per_block_first: int = 4,
 ) -> int:
-    """Compute number of generation blocks (including Global Prefix).
+    """Compute number of generation blocks.
 
-    Block 0 is the Global Prefix (V_0 + A_0, 1 video frame + 1 audio frame).
-    Blocks 1..N are standard blocks of num_frame_per_block each.
+    Block 0 covers num_frame_per_block_first video frames; blocks 1..N each
+    cover num_frame_per_block frames. Total must align exactly:
+        total = num_frame_per_block_first + k * num_frame_per_block
     """
-    import math
-    if total_video_latent_frames <= 1:
-        return 1  # Only Global Prefix
-    remaining = total_video_latent_frames - 1
-    return 1 + math.ceil(remaining / num_frame_per_block)
+    if total_video_latent_frames < num_frame_per_block_first:
+        raise ValueError(
+            f"total_video_latent_frames={total_video_latent_frames} smaller than "
+            f"num_frame_per_block_first={num_frame_per_block_first}"
+        )
+    remaining = total_video_latent_frames - num_frame_per_block_first
+    if remaining % num_frame_per_block != 0:
+        raise ValueError(
+            f"total_video_latent_frames={total_video_latent_frames} not aligned to "
+            f"{num_frame_per_block_first} + k * {num_frame_per_block}"
+        )
+    return 1 + remaining // num_frame_per_block

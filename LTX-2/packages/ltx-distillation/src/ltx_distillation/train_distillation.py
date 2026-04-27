@@ -187,16 +187,23 @@ class Trainer:
             weight_decay=weight_decay,
         )
 
+        beta1_critic = getattr(config, "beta1_critic", config.beta1)
+        beta2_critic = getattr(config, "beta2_critic", config.beta2)
         self.critic_optimizer = torch.optim.AdamW(
             [p for p in self.dmd.fake_score.parameters() if p.requires_grad],
             lr=critic_lr,
-            betas=(config.beta1, config.beta2),
+            betas=(beta1_critic, beta2_critic),
             weight_decay=weight_decay,
         )
 
         # Learning rate schedulers
         self.generator_scheduler = self._create_lr_scheduler(self.generator_optimizer)
         self.critic_scheduler = self._create_lr_scheduler(self.critic_optimizer)
+
+        # EMA (initialized lazily at ema_start_step to save memory for early steps)
+        self.ema_weight = getattr(config, "ema_weight", 0.0)
+        self.ema_start_step = getattr(config, "ema_start_step", 200)
+        self.generator_ema = None
 
         # Dataloader
         self._init_dataloader()
@@ -221,6 +228,12 @@ class Trainer:
             self.dmd.generator.load_state_dict(ckpt["generator"])
             self.dmd.fake_score.load_state_dict(ckpt["critic"])
             self.step = ckpt.get("step", 0)
+            if "generator_ema" in ckpt and self.ema_weight > 0:
+                from ltx_distillation.ema import EMA_FSDP
+                self.generator_ema = EMA_FSDP(self.dmd.generator, decay=self.ema_weight)
+                self.generator_ema.load_state_dict(ckpt["generator_ema"])
+                if self.is_main_process:
+                    print(f"[Resume] Loaded EMA state")
             if self.is_main_process:
                 print(f"[Resume] Resumed at step {self.step}")
 
@@ -436,6 +449,8 @@ class Trainer:
             "critic": critic_state_dict,
             "step": self.step,
         }
+        if self.generator_ema is not None:
+            state_dict["generator_ema"] = self.generator_ema.state_dict()
 
         if self.is_main_process:
             checkpoint_dir = os.path.join(
@@ -586,6 +601,10 @@ class Trainer:
                     self.dmd.generator.parameters(), self.max_grad_norm
                 )
             self.generator_optimizer.step()
+
+            # EMA update
+            if self.generator_ema is not None:
+                self.generator_ema.update(self.dmd.generator)
 
             # ---- Memory cleanup between generator and critic training ----
             # Save scalar metrics before freeing the computation graph.
@@ -743,7 +762,9 @@ class Trainer:
                     add_noise_fn=self.dmd.add_noise,
                     denoising_sigmas=self.dmd.denoising_sigmas,
                     num_frame_per_block=self.benchmark_num_frame_per_block,
-                    use_kv_cache=self.benchmark_use_kv_cache,
+                    num_frame_per_block_first=getattr(config, "num_frame_per_block_first", 4),
+                    context_noise=int(getattr(config, "context_noise", 0)),
+                    num_train_timestep=int(getattr(config, "num_train_timestep", 1000)),
                     clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
                 )
             else:
@@ -843,11 +864,8 @@ class Trainer:
             if benchmark_wandb_dict:
                 wandb.log(benchmark_wandb_dict, step=self.step)
 
-            # One line: timing + save path (flush so it always appears in logs)
             print(
                 f"[Benchmark] Step {self.step}: {num_prompts} video(s) | "
-                f"wall {benchmark_wall_elapsed:.2f}s ({time_per_video_wall:.2f}s/video) | "
-                f"generate {total_generate_seconds:.2f}s ({time_per_video_generate:.2f}s/video) | "
                 f"saved to {step_dir}",
                 flush=True,
             )
@@ -972,6 +990,17 @@ class Trainer:
                 self.previous_time = current_time
 
             self.step += 1
+
+            # Lazy EMA initialization at ema_start_step
+            if (
+                self.generator_ema is None
+                and self.ema_weight > 0
+                and self.step >= self.ema_start_step
+            ):
+                from ltx_distillation.ema import EMA_FSDP
+                if self.is_main_process:
+                    print(f"[EMA] Initializing EMA with decay={self.ema_weight} at step {self.step}")
+                self.generator_ema = EMA_FSDP(self.dmd.generator, decay=self.ema_weight)
 
             # Step LR schedulers based on global step (both stay synchronized)
             if self.generator_scheduler is not None:

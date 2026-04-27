@@ -39,7 +39,7 @@ from torch.distributed.fsdp.wrap import (
 from omegaconf import OmegaConf, DictConfig
 import wandb
 
-from ltx_distillation.inference.ode_benchmark_pipeline import ODEAutoregressiveBenchmarkPipeline
+from ltx_distillation.inference.causal_pipeline import CausalAVInferencePipeline
 from ltx_distillation.ode.data import ODERegressionLMDBDataset, collate_ode_batch
 from ltx_distillation.ode.ode_regression import LTX2ODERegression, ODERegressionConfig
 from ltx_distillation.util import fsdp_state_dict as shared_fsdp_state_dict
@@ -251,13 +251,13 @@ class ODETrainer:
             denoising_step_list=tuple(config.denoising_step_list),
             generator_task=config.generator_task,
             num_frame_per_block=config.get("num_frame_per_block", 3),
+            num_frame_per_block_first=config.get("num_frame_per_block_first", 4),
             gradient_checkpointing=config.gradient_checkpointing,
             mixed_precision=config.mixed_precision,
             uniform_timestep=config.get("uniform_timestep", False),
             loss_target=config.get("loss_target", "velocity"),
             disable_causal_mask=config.get("disable_causal_mask", False),
             enable_causal_log_rescale=config.get("enable_causal_log_rescale", False),
-            num_audio_sink_tokens=config.get("num_audio_sink_tokens", 0),
             # Loss weights
             video_loss_weight=config.get("video_loss_weight", 1.0),
             audio_loss_weight=config.get("audio_loss_weight", 0.0),
@@ -485,24 +485,32 @@ class ODETrainer:
             self.benchmark_enabled = False
             return
 
-        try:
-            self.benchmark_prompts = dataset.get_prompts(self.benchmark_num_prompts)
-        except Exception as e:
-            if self.is_main_process:
-                print(f"[Benchmark] Failed to load prompts from LMDB: {e}")
-            self.benchmark_enabled = False
-            return
+        # Load benchmark prompts: prefer benchmark_prompt_file, fallback to LMDB.
+        prompt_file = config.get("benchmark_prompt_file", None)
+        if prompt_file and os.path.exists(prompt_file):
+            with open(prompt_file, "r") as f:
+                self.benchmark_prompts = [l.strip() for l in f if l.strip()]
+            self.benchmark_prompts = self.benchmark_prompts[:self.benchmark_num_prompts]
+            prompt_source = prompt_file
+        else:
+            try:
+                self.benchmark_prompts = dataset.get_prompts(self.benchmark_num_prompts)
+                prompt_source = "LMDB"
+            except Exception as e:
+                if self.is_main_process:
+                    print(f"[Benchmark] Failed to load prompts from LMDB: {e}")
+                self.benchmark_enabled = False
+                return
 
         if not self.benchmark_prompts:
             if self.is_main_process:
-                print("[Benchmark] Disabled because no prompts were loaded from the ODE LMDB.")
+                print("[Benchmark] Disabled because no prompts were loaded.")
             self.benchmark_enabled = False
             return
 
         if self.is_main_process:
             print(
-                f"[Benchmark] Loaded {len(self.benchmark_prompts)} prompt(s) from the first "
-                f"{min(len(dataset), self.benchmark_num_prompts)} LMDB entries"
+                f"[Benchmark] Loaded {len(self.benchmark_prompts)} prompt(s) from {prompt_source}"
             )
             print(
                 f"[Benchmark] block_frames={self.benchmark_num_frame_per_block}, "
@@ -627,16 +635,33 @@ class ODETrainer:
                 f"across {self.world_size} rank(s) in {num_rounds} round(s)..."
             )
 
-        pipeline = ODEAutoregressiveBenchmarkPipeline(
+        pipeline = CausalAVInferencePipeline(
             generator=self.ode_model._generator,
             add_noise_fn=self._benchmark_add_noise,
             denoising_sigmas=self.benchmark_denoising_sigmas,
             num_frame_per_block=self.benchmark_num_frame_per_block,
+            num_frame_per_block_first=getattr(self.config, "num_frame_per_block_first", 4),
+            context_noise=int(getattr(self.config, "context_noise", 0)),
+            num_train_timestep=int(getattr(self.config, "num_train_timestep", 1000)),
             clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
         )
 
         was_training = self.ode_model._generator.training
         self.ode_model._generator.eval()
+
+        # Pass the FSDP-wrapped generator directly. FSDP all-gathers parameters
+        # inside forward(), so we don't need summon_full_params. The pipeline
+        # calls self.generator(...) which goes through __call__ → FSDP hooks.
+        pipeline = CausalAVInferencePipeline(
+            generator=self.ode_model._generator,
+            add_noise_fn=self._benchmark_add_noise,
+            denoising_sigmas=self.benchmark_denoising_sigmas,
+            num_frame_per_block=self.benchmark_num_frame_per_block,
+            num_frame_per_block_first=getattr(self.config, "num_frame_per_block_first", 4),
+            context_noise=int(getattr(self.config, "context_noise", 0)),
+            num_train_timestep=int(getattr(self.config, "num_train_timestep", 1000)),
+            clear_cuda_cache_per_round=self.benchmark_clear_cuda_cache_per_round,
+        )
 
         benchmark_wall_start = time.perf_counter()
         my_total_generate_seconds = 0.0
@@ -722,12 +747,8 @@ class ODETrainer:
 
             wandb.log(benchmark_wandb_dict, step=self.step)
 
-            wall_per_video = benchmark_wall_elapsed / max(1, num_prompts)
-            generate_per_video = total_generate_seconds / max(1, num_prompts)
             print(
                 f"[Benchmark] Step {self.step}: {num_prompts} sample(s) | "
-                f"wall {benchmark_wall_elapsed:.2f}s ({wall_per_video:.2f}s/video) | "
-                f"generate {total_generate_seconds:.2f}s ({generate_per_video:.2f}s/video) | "
                 f"saved to {step_dir}",
                 flush=True,
             )
@@ -944,20 +965,38 @@ class ODETrainer:
         for t_bucket, losses in loss_breakdown.items():
             stats[f"loss_at_time_{t_bucket}"] = sum(losses) / len(losses)
 
-        # Backward pass
-        self.optimizer.zero_grad()
-        loss.backward()
+        # Backward pass with gradient accumulation.
+        # Accumulate gradients over gradient_accumulation_steps micro-batches
+        # before applying an optimizer step. Loss is scaled by 1/accum_steps
+        # so the effective gradient equals the mean over all micro-batches.
+        accum_steps = self.gradient_accumulation_steps
+        is_first_micro = (self.step % accum_steps == 0)
+        is_last_micro = ((self.step + 1) % accum_steps == 0)
+
+        if is_first_micro:
+            self.optimizer.zero_grad()
+
+        scaled_loss = loss / accum_steps
+
+        # Use no_sync() on intermediate micro-batches to skip redundant
+        # FSDP all-reduce. Only the last micro-batch triggers gradient sync.
+        if not is_last_micro and hasattr(self.ode_model._generator, 'no_sync'):
+            with self.ode_model._generator.no_sync():
+                scaled_loss.backward()
+        else:
+            scaled_loss.backward()
 
         # === Deep diagnostics: rank 0 only, write to log file ===
         should_diag = self.is_main_process and (self.step < 10 or self.step % 50 == 0)
         if should_diag:
             self._log_deep_diagnostics(loss, log_dict)
 
-        # Gradient clipping
-        grad_norm = self.ode_model._generator.clip_grad_norm_(self.max_grad_norm)
-
-        # Optimizer step
-        self.optimizer.step()
+        if is_last_micro:
+            # Gradient clipping + optimizer step
+            grad_norm = self.ode_model._generator.clip_grad_norm_(self.max_grad_norm)
+            self.optimizer.step()
+        else:
+            grad_norm = torch.tensor(0.0)
 
         # Logging
         if self.is_main_process:
@@ -1368,8 +1407,9 @@ class ODETrainer:
         while self.step < max_steps:
             self.train_one_step()
 
-            # Checkpointing
-            if not self.config.get("no_save", False) and self.step % log_iters == 0:
+            # Checkpointing (save_iters defaults to log_iters for backward compat)
+            save_iters = int(self.config.get("save_iters", log_iters))
+            if not self.config.get("no_save", False) and self.step % save_iters == 0:
                 self.save()
                 torch.cuda.empty_cache()
                 # Ensure generator stays in train mode after save
