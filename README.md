@@ -18,6 +18,7 @@
 
 ## News
 
+- **[2026/04]** Improved training pipeline: simplified 2-stage pipeline (ODE init + Self-Forcing DMD). Disabled FlexAttention due to numerical issues; use standard SDPA instead. Provided KV-cache causal inference example. Uploaded a sample dataset for quick start.
 - **[2026/03]** Full training code and data processing pipeline open-sourced.
 - **[2026/03]** Paper released on [arXiv 2603.11647](https://arxiv.org/abs/2603.11647). Project page is live at [OmniForcing.com](https://omniforcing.com).
 
@@ -89,7 +90,7 @@ OmniForcing employs a **three-stage distillation pipeline** to progressively tra
 
 - Python >= 3.10
 - PyTorch >= 2.2.0
-- 8x or 32x GPUs with 96GB+ memory (H200 recommended). Causal DMD branch may work on lower-memory GPUs.
+- Minimum 8x H200 GPUs (141GB). Recommended 32x H200+ (4 nodes x 8 GPUs) for faster training.
 
 ### Installation
 
@@ -119,11 +120,72 @@ Download the following pretrained models and update the paths in the config file
 
 
 
-## Training Pipeline
+## Training Pipeline v2 (Recommended)
 
-> **Note:** Support for LTX-2.3, improved inference pipeline, and future new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
+> **Note:** Support for LTX-2.3, streaming inference pipeline, official deeply trained checkpoints, and our new work will be released soon. Multi-node launch scripts may need modification depending on your cluster scheduler (SLURM, etc.).
 
-The training follows a three-stage pipeline. We recommend **32 GPUs** (4 nodes x 8 GPUs) for optimal performance. You can also train with **8 GPUs** by setting `gradient_accumulation_steps: 4` in the config.
+> This is the improved training pipeline that is more stable and requires fewer stages. It skips the Stage 1 bidirectional DMD step entirely — the original LTX-2 checkpoint serves directly as the teacher model.
+
+The training follows a **two-stage pipeline** starting from the pretrained LTX-2 checkpoint:
+
+### Step 1: Generate ODE Trajectory Pairs
+
+Generate ODE trajectory pairs using the pretrained LTX-2 model as the teacher with full guidance (CFG + STG + modality scale + rescale):
+
+```bash
+cd LTX-2/packages/ltx-distillation
+
+# Single node, 8 GPUs (uses CFG + STG + modality scale + rescale by default):
+torchrun --nproc_per_node=8 \
+    -m ltx_distillation.ode.generate_ode_pairs \
+    --teacher_checkpoint /path/to/ltx-2-19b-dev.safetensors \
+    --gemma_path /path/to/gemma-3-12b-it-qat-q4_0-unquantized \
+    --prompts_file /path/to/prompts.txt \
+    --output_dir ./ode_pairs \
+    --video_guidance_scale 3.0 \
+    --audio_guidance_scale 5.0 \
+    --rescale_scale 0.7
+
+# Then create LMDB:
+python -m ltx_distillation.ode.create_lmdb \
+    --data_path ./ode_pairs --lmdb_path ./ode_lmdb
+```
+
+### Step 2: Causal ODE Regression (Stage 2)
+
+Initializes the causal autoregressive model directly from the pretrained LTX-2 checkpoint using ODE trajectory regression. Uses a 4-3-3-3-3 block layout and SDPA attention.
+
+```bash
+# Edit configs/stage2_causal_ode.yaml with your paths, then:
+./scripts/train_stage2_causal_ode.sh
+```
+
+### Step 3: Self-Forcing DMD (Stage 3)
+
+Trains the causal autoregressive model with KV-cache self-forcing rollout and DMD loss. The generator autoregressively unrolls from pure noise using a real KV cache (matching inference exactly), with context-noise cache refresh to close the train/inference distribution gap.
+
+```bash
+# Edit configs/stage3_causal_dmd.yaml with your paths, then:
+./scripts/train_stage3_causal_dmd.sh
+```
+
+### Hardware Requirements
+
+| Setup | GPUs | Notes |
+|-------|------|-------|
+| **Minimum** | 8x H200 (141GB) | 1 node, `gradient_accumulation_steps: 2` for Stage 2 |
+| **Recommended** | 32x H200+ (4 nodes x 8) | Faster training, larger effective batch size |
+
+---
+
+## Training Pipeline v1 (Legacy)
+
+> If you need the Stage 1 bidirectional DMD training for any purpose, please checkout commit [`9c25f15`](https://github.com/OmniForcing/OmniForcing/commit/9c25f15bad287da5d5bd084b2911b3bc47e0f1c4) and follow the instructions below.
+
+<details>
+<summary>Click to expand legacy 3-stage pipeline</summary>
+
+The legacy training follows a three-stage pipeline. We recommend **32 GPUs** (4 nodes x 8 GPUs) for optimal performance. You can also train with **8 GPUs** by setting `gradient_accumulation_steps: 4` in the config.
 
 ### Stage 1: Bidirectional DMD
 
@@ -215,7 +277,7 @@ git checkout causal-dmd
 ./scripts/train_stage3_causal_dmd.sh
 ```
 
-### Hardware Recommendations
+### Hardware Recommendations (Legacy)
 
 | Setup | GPUs | Config Change |
 |-------|------|---------------|
@@ -223,6 +285,8 @@ git checkout causal-dmd
 | Minimum | 8 (1 node) | Set `gradient_accumulation_steps: 4` |
 
 All training scripts auto-detect SLURM and multi-node environment variables. For multi-node training, set `NNODES`, `NODE_RANK`, and `MASTER_ADDR`.
+
+</details>
 
 
 ## Repository Structure
