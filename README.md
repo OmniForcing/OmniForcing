@@ -6,7 +6,7 @@
 
 [Yaofeng Su]()\*<sup>1,2</sup>, [Yuming Li]()\*<sup>3</sup>, [Zeyue Xue]()<sup>1,4</sup>, [Jie Huang]()<sup>1</sup>, [Siming Fu]()<sup>1</sup>, [Haoran Li]()<sup>1</sup>, [Ying Li]()<sup>3</sup>, [Zezhong Qian]()<sup>3</sup>, [Haoyang Huang]()<sup>1</sup>, [Nan Duan]()<sup>1</sup>
 
-\*Equal contribution &ensp;|&ensp; <sup>1</sup>JD Explore Academy &ensp; <sup>2</sup>Fudan University &ensp; <sup>3</sup>Peking University &ensp; <sup>4</sup>The University of Hong Kong
+\*Equal contribution &ensp;|&ensp; <sup>1</sup>Joy Future Academy, JD &ensp; <sup>2</sup>Fudan University &ensp; <sup>3</sup>Peking University &ensp; <sup>4</sup>The University of Hong Kong
 
 <a href="https://arxiv.org/abs/2603.11647"><img src="https://img.shields.io/badge/arXiv-2603.11647-b31b1b.svg" alt="arXiv"></a>
 <a href="https://omniforcing.com"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project Page"></a>
