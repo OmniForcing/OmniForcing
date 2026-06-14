@@ -10,7 +10,7 @@
 
 <a href="https://arxiv.org/abs/2603.11647"><img src="https://img.shields.io/badge/arXiv-2603.11647-b31b1b.svg" alt="arXiv"></a>
 <a href="https://omniforcing.com"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project Page"></a>
-
+<a href="https://huggingface.co/Exploration/omniforcing-ltx2-5s-causal"><img src="https://img.shields.io/badge/🤗%20Model-Card-yellow.svg" alt="Model Card"></a>
 </div>
 
 **OmniForcing** is the first framework to distill an offline, bidirectional joint audio-visual diffusion model into a **real-time streaming autoregressive generator**. Built on top of LTX-2 (14B video + 5B audio), OmniForcing achieves streaming t2av generation while maintaining visual and acoustic fidelity on par with the bidirectional teacher model.
