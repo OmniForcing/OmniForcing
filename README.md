@@ -118,6 +118,39 @@ Download the following pretrained models and update the paths in the config file
 | `gemma-3-12b-it-qat-q4_0-unquantized` | Gemma 3 12B text encoder (unquantized QAT variant) |
 
 
+## Example Checkpoint
+
+```text
+omniforcing_ltx2_5s_causal.safetensors.index.json
+omniforcing_ltx2_5s_causal-00001-of-000XX.safetensors
+...
+```
+
+These files contain OmniForcing causal generator weights. They do not include the LTX-2 base model, video VAE, audio VAE, or Gemma text encoder.
+
+## Usage
+
+```bash
+python LTX-2/packages/ltx-distillation/scripts/omniforcing_causal_inference.py \
+  --base-checkpoint /path/to/ltx-2-19b-dev.safetensors \
+  --vae-checkpoint /path/to/ltx-2-19b-dev.safetensors \
+  --gemma-path /path/to/gemma-3-12b-it-qat-q4_0-unquantized \
+  --generator-ckpt /path/to/omniforcing_ltx2_5s_causal.safetensors.index.json \
+  --prompt "Realistic locked-off shot. Ocean waves roll onto a quiet rocky shore at dawn, foam spreading over dark stones before sliding back into the sea. The camera holds still as pale morning light grows over the horizon. The soundtrack is layered with surf, gulls calling far away, and a steady coastal wind." \
+  --output-dir outputs/demo
+```
+
+`--vae-checkpoint` is optional. If omitted, the inference script loads the video and audio VAEs from `--base-checkpoint`.
+
+**Example Prompts**
+
+Realistic locked-off shot. Ocean waves roll onto a quiet rocky shore at dawn, foam spreading over dark stones before sliding back into the sea. The camera holds still as pale morning light grows over the horizon. The soundtrack is layered with surf, gulls calling far away, and a steady coastal wind.
+
+Realistic documentary style. A Japanese blacksmith in his sixties, wearing a soot-stained apron over a dark indigo shirt, raises a short-handled hammer above a glowing orange blade resting on an anvil. The camera frames a tight close-up of the strike — sparks erupt in a bright fan across the dim workshop. Each hammer blow rings out sharp and metallic, echoing off stone walls while the charcoal forge crackles and hisses behind him. Warm amber light from the forge illuminates the sweat on his brow. He tilts the blade, inspecting the edge, and the camera slowly pulls back to reveal rows of finished knives hanging on a wooden rack.
+
+Realistic slow dolly back. An old vinyl record player sits on a cluttered desk in a dimly lit student apartment, the needle tracing the grooves of a jazz LP. The camera starts in an extreme close-up of the stylus riding the record surface, then slowly pulls back to reveal stacked books, an open laptop, and a steaming mug. The warm crackle of vinyl underlies a mellow saxophone melody that fills the small room. A desk lamp casts a warm amber pool, leaving the corners in soft shadow. The record label spins steadily, and the faintest scratch artifact punctuates the music every few seconds.
+
+Realistic dolly-back wide shot. Two elderly men sit across a stone chess table in a Mediterranean plaza at golden hour, one leaning forward to move a bishop. The camera slowly pulls back, revealing the wider square — a fountain, pigeons, a boy on a bicycle. The first man taps the piece down with a decisive click and says with a dry smile: "Check. And this time, don't pretend you didn't see it." The other leans back, arms crossed, studying the board, and mutters: "I wasn't pretending. I was being generous." Warm light stretches long shadows across the flagstones, and the fountain's gentle splash mixes with distant church bells tolling the hour.
 
 
 ## Training Pipeline v2 (Recommended)
@@ -346,3 +379,7 @@ If you find OmniForcing useful in your research, please consider citing:
 ## Acknowledgements
 
 OmniForcing builds upon several outstanding works. We thank the authors of [LTX-2](https://github.com/Lightricks/LTX-2), [Self-Forcing](https://github.com/guandeh17/Self-Forcing), [CausVid](https://github.com/tianweiy/CausVid), and [DMD](https://github.com/tianweiy/DMD2) for their pioneering contributions.
+
+## License
+
+This checkpoint is derived from LTX-2 and is distributed under the LTX-2 Community License Agreement.
