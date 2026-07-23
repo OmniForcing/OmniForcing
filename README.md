@@ -1,6 +1,6 @@
 <div align="center">
 
-# OmniForcing: Unleashing Real-time Joint Audio-Visual Generation
+# [ECCV 2026 Oral] OmniForcing: Unleashing Real-time Joint Audio-Visual Generation
 
 <img src="static/images/teaser_2.png" width="100%">
 
@@ -8,6 +8,7 @@
 
 \*Equal contribution &ensp;|&ensp; <sup>1</sup>Joy Future Academy, JD &ensp; <sup>2</sup>Fudan University &ensp; <sup>3</sup>Peking University &ensp; <sup>4</sup>The University of Hong Kong
 
+<a href="https://arxiv.org/abs/2603.11647"><img src="https://img.shields.io/badge/ECCV%202026-Oral-4b44ce.svg" alt="ECCV 2026 Oral"></a>
 <a href="https://arxiv.org/abs/2603.11647"><img src="https://img.shields.io/badge/arXiv-2603.11647-b31b1b.svg" alt="arXiv"></a>
 <a href="https://omniforcing.com"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project Page"></a>
 <a href="https://huggingface.co/Exploration/omniforcing-ltx2-5s-causal"><img src="https://img.shields.io/badge/🤗%20Model-Card-yellow.svg" alt="Model Card"></a>
@@ -17,7 +18,7 @@
 
 
 ## News
-
+- **[2026/07]** 🎉 OmniForcing has been accepted to **ECCV 2026** as an **Oral** presentation!
 - **[2026/04]** Improved training pipeline: simplified 2-stage pipeline (ODE init + Self-Forcing DMD). Disabled FlexAttention due to numerical issues; use standard SDPA instead. Provided KV-cache causal inference example. Uploaded a sample dataset for quick start.
 - **[2026/03]** Full training code and data processing pipeline open-sourced.
 - **[2026/03]** Paper released on [arXiv 2603.11647](https://arxiv.org/abs/2603.11647). Project page is live at [OmniForcing.com](https://omniforcing.com).
